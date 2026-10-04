@@ -120,7 +120,9 @@ public repository into its VM, runs the tests and summarises them, plus the
 `release` script and a model-free smoke test. Its `smoke` and `release`
 scripts load `.env` the way `flue run` does; run `release` with the same
 `REPO_AGENT_TAGS` as the agent (or fewer), since the lookup matches every
-configured tag.
+configured tag. The example installs `flue-cove` as a copy (`install-links`),
+built by the root package's `prepare` script, so reinstall the example
+(`npm ci` there) after changing the adapter.
 
 ### Options
 

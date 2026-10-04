@@ -13,14 +13,19 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, beforeEach, describe, it } from "node:test";
-import { CoveConnectionError } from "@cove/sdk";
+import { CoveClient, CoveConnectionError } from "@cove/sdk";
 import {
   SandboxDiedError,
   SandboxOperationUnsupportedError,
   sandboxFromDriver,
 } from "@flue/runtime";
 import { CoveSandboxDriver } from "../src/driver.ts";
-import { type CoveFiles, DownloadTruncatedError, FileTooLargeError } from "../src/files.ts";
+import {
+  type CoveFiles,
+  DownloadTruncatedError,
+  FileTooLargeError,
+  filesFor,
+} from "../src/files.ts";
 import { apiError, localShellClient } from "./helpers.ts";
 
 const root = mkdtempSync(join(tmpdir(), "flue-cove-files-"));
@@ -726,5 +731,65 @@ describe("a server with the file route", () => {
     writeFileSync(join(dir, "f"), "x");
     await driver.readFile(join(dir, "f"));
     assert.equal(used.filter((u) => u.startsWith("download")).length, 2);
+  });
+});
+
+describe("a 200 the SDK cannot trust (no Content-Length, or a content encoding)", () => {
+  /** A driver over a real CoveClient whose fetch answers every file call with `respond`. */
+  function viaSdk(respond: (method: string) => Response) {
+    const client = new CoveClient({
+      baseUrl: "http://127.0.0.1:8091",
+      token: "cvk_unit",
+      fetch: (async (_u: unknown, init?: RequestInit) =>
+        respond(init?.method ?? "GET")) as typeof fetch,
+    });
+    const shell = localShellClient();
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: filesFor(client) });
+    return { driver, calls: shell.calls };
+  }
+
+  it("a HEAD 200 without Content-Length: stat and exists ask the shell", async () => {
+    const { driver, calls } = viaSdk(() => new Response(null, { status: 200 }));
+    writeFileSync(join(dir, "f"), "abcd");
+    assert.equal((await driver.stat(join(dir, "f"))).size, 4);
+    assert.equal(await driver.exists(join(dir, "f")), true);
+    assert.equal(calls.length, 2);
+  });
+
+  it("a GET 200 without Content-Length: the read falls back to exec", async () => {
+    const { driver, calls } = viaSdk(() => {
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(new Uint8Array([1]));
+          c.close();
+        },
+      });
+      return new Response(body, { status: 200 });
+    });
+    writeFileSync(join(dir, "f"), "from the shell");
+    assert.equal(await driver.readFile(join(dir, "f")), "from the shell");
+    assert.equal(calls.length, 1);
+  });
+
+  it("a GET 200 with Content-Encoding gzip: the read falls back to exec", async () => {
+    const { driver, calls } = viaSdk(
+      () =>
+        new Response(new Uint8Array([1, 2]), {
+          status: 200,
+          headers: { "content-length": "2", "content-encoding": "gzip" },
+        }),
+    );
+    writeFileSync(join(dir, "f"), "plain");
+    assert.equal(await driver.readFile(join(dir, "f")), "plain");
+    assert.equal(calls.length, 1);
+  });
+
+  it("a truncated download is still a hard failure", async () => {
+    const { driver, calls } = viaSdk(
+      () =>
+        new Response(new Uint8Array([1, 2]), { status: 200, headers: { "content-length": "9" } }),
+    );
+    await assert.rejects(driver.readFile(join(dir, "f")), DownloadTruncatedError);
+    assert.equal(calls.length, 0);
   });
 });

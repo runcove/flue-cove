@@ -98,3 +98,16 @@ describe("a CoveClient from a second @cove/sdk copy", () => {
     assert.equal(gets, 1);
   });
 });
+
+describe("isPlainCoveError", () => {
+  it("is true only for the SDK's base CoveError, from either copy", async () => {
+    const { isPlainCoveError } = await import("../src/errors.ts");
+    const sdk = await import("@cove/sdk");
+    assert.equal(isPlainCoveError(new sdk.CoveError("no Content-Length")), true);
+    assert.equal(isPlainCoveError(new Other.CoveError("no Content-Length")), true);
+    assert.equal(isPlainCoveError(new sdk.CoveConnectionError("down")), false);
+    assert.equal(isPlainCoveError(new sdk.DownloadTruncatedError(9, 2)), false);
+    assert.equal(isPlainCoveError(new sdk.NotFoundError(404, "x")), false);
+    assert.equal(isPlainCoveError(new Error("x")), false);
+  });
+});

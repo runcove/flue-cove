@@ -27,3 +27,17 @@ export function apiErrorStatus(
   }
   return { status, code };
 }
+
+/**
+ * True for an error the SDK raised itself with no HTTP error behind it: its
+ * base class `CoveError` and nothing more specific. Downloads and stats raise
+ * one for a 200 they cannot trust: no readable `Content-Length`, or a
+ * `Content-Encoding` other than identity (a proxy that compressed the body).
+ * Not a connection failure (`CoveConnectionError`), not a truncated download
+ * (`DownloadTruncatedError`), not an abort. Recognised by class name, from
+ * any copy of the SDK.
+ */
+export function isPlainCoveError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  return (err as { name?: unknown }).name === "CoveError" && apiErrorStatus(err) === undefined;
+}

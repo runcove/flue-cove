@@ -22,7 +22,7 @@ import {
   SandboxOperationUnsupportedError,
   type ShellResult,
 } from "@flue/runtime";
-import { apiErrorStatus } from "./errors.ts";
+import { apiErrorStatus, isPlainCoveError } from "./errors.ts";
 import { type CoveFiles, fileErrorStatus } from "./files.ts";
 import { buildScript } from "./quote.ts";
 import {
@@ -530,7 +530,13 @@ export class CoveSandboxDriver implements SandboxDriver {
     path: string,
   ): void {
     const http = fileErrorStatus(err);
-    if (!http) throw err;
+    if (!http) {
+      // A 200 the SDK refused to trust (no Content-Length, or a compressed
+      // body whose length no longer counts its bytes): the shell can still
+      // stat and read the file. A truncated download is never one of these.
+      if (op !== "upload" && isPlainCoveError(err)) return;
+      throw err;
+    }
     // Only the file route's own handlers send a code.
     if (http.code !== undefined) this.#routeSeen();
     // A GET or PUT 404 from a server with the file route always names what is

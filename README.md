@@ -207,7 +207,12 @@ the fallback. 404 is `ENOENT`. 413 `file_too_large` is an error for
 `readFile`/`readFileBuffer`/`writeFile`; `stat` and `exists` fall back to exec
 on it, since a shell can still stat a file too big to transfer. A VM that is not running or is gone becomes Flue's
 `SandboxDiedError`, as does a `paused` event in the middle of an exec. 429
-(rate limit) and file-API 503 (`unavailable`) are retried with backoff.
+(rate limit) and file-API 503 (`unavailable`) are retried with backoff. A
+`200` the SDK cannot trust (no readable `Content-Length`, or a
+`Content-Encoding` such as gzip added by a proxy) also sends `stat`, `exists`
+and reads to exec. A download whose body stops short of its `Content-Length`
+(`DownloadTruncatedError`) fails and is never retried over exec: it is never
+taken for a complete file.
 
 A server that predates the file API answers every `/files` request with its
 router's bare 404, which has no error code. The real route always names what

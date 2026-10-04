@@ -8,6 +8,7 @@
  *   Flue itself never tears a sandbox down; cleanup is the application's job.
  */
 import {
+  CoveAPIError,
   type CoveClient,
   type CoveClientOptions,
   NotFoundError,
@@ -272,7 +273,7 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
         if (await revive(vm)) return vm.name;
       }
     }
-    const { name } = await rl(() =>
+    const { name } = await retryReservedName(() =>
       vms.create({
         ...(options.image !== undefined ? { image: options.image } : {}),
         ...(options.cpus !== undefined ? { cpus: options.cpus } : {}),
@@ -371,6 +372,23 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
     },
     vmName: (id) => resolved.get(id),
   };
+}
+
+/**
+ * Create, retrying 429s, and retrying (a few times) the 400 Cove answers when
+ * the name it generated is already reserved by a leftover Warpgate target:
+ * each attempt gets a fresh generated name. Any other 400 is final.
+ */
+async function retryReservedName<T>(create: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await withRateLimitRetry(create);
+    } catch (err) {
+      const reserved =
+        err instanceof CoveAPIError && err.status === 400 && /name is reserved/i.test(err.message);
+      if (!reserved || attempt >= 3) throw err;
+    }
+  }
 }
 
 function rank(state: VmState): number {

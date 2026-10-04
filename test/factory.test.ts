@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
+  CoveAPIError,
   type CreateVmRequest,
   type ExecEvent,
   NotFoundError,
@@ -299,6 +300,38 @@ describe("coveVms: release", () => {
     await factory.release("busy");
     assert.equal(fake.creates.length, 1);
     assert.equal(fake.vms.size, 0);
+  });
+
+  it("retries a create whose server-generated name collides with a reserved name", async () => {
+    const fake = fakeCove();
+    const create = fake.client.vms.create;
+    let n = 0;
+    fake.client.vms.create = async (req) => {
+      if (++n < 2) {
+        throw new CoveAPIError(
+          400,
+          "HTTP 400: VM name invalid: name is reserved: a Warpgate target of that name already exists",
+          "validation_failed",
+        );
+      }
+      return create(req);
+    };
+    await coveVms({ client: fake.client, files: noFiles }).createSandbox({ id: "n" });
+    assert.equal(n, 2);
+  });
+
+  it("does not retry other 400s", async () => {
+    const fake = fakeCove();
+    let n = 0;
+    fake.client.vms.create = async () => {
+      n++;
+      throw new CoveAPIError(400, "HTTP 400: unknown image", "validation_failed");
+    };
+    await assert.rejects(
+      coveVms({ client: fake.client, files: noFiles }).createSandbox({ id: "n" }),
+      /unknown image/,
+    );
+    assert.equal(n, 1);
   });
 
   it("release of an unknown id is a no-op", async () => {

@@ -1,0 +1,27 @@
+{
+  "name": "repo-agent",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Example Flue agent that clones a public repository into a Cove VM, runs its tests and summarises them",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "agent": "flue run src/agents/repo-agent.ts",
+    "smoke": "node smoke.ts",
+    "release": "node src/release.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@flue/runtime": "2.2.2",
+    "flue-cove": "file:../.."
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.87.1",
+    "@flue/cli": "2.2.2",
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3",
+    "vite": "8.3.1"
+  }
+}

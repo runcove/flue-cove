@@ -121,8 +121,10 @@ public repository into its VM, runs the tests and summarises them, plus the
 scripts load `.env` the way `flue run` does; run `release` with the same
 `REPO_AGENT_TAGS` as the agent (or fewer), since the lookup matches every
 configured tag. The example installs `flue-cove` as a copy (`install-links`),
-built by the root package's `prepare` script, so reinstall the example
-(`npm ci` there) after changing the adapter.
+built by the root package's `prepare` script, which needs the root's dev
+dependencies: run `npm ci` at the repository root first, then `npm ci` in
+`examples/repo-agent`. Reinstall the example (`npm ci` there) after changing
+the adapter.
 
 ### Options
 
@@ -253,7 +255,7 @@ These were measured against a Cove 0.33.2 server.
 |---|---|
 | `npm test` | Unit tests with no Cove server: quoting through a real `sh`, env-name validation, timeout rounding, every exec terminal event (`exit`, `error`, `paused`, timeout → 124), abort and timeout killing the process group, every file-API status and its fallback (a filesystem-backed fake with Cove's rules, plus the fetch client against a mock `fetch`), short bodies, 429/503 retries, id dedupe and reuse, release, and that the API key never leaks into errors or serialized objects |
 | `npm run test:integration` | Against a live Cove server (skipped without `COVE_API_URL` and a key): creates a VM through `coveVms`, runs every Sandbox operation through Flue's `sandboxFromDriver` (text, binary and multi-MiB files, symlinked paths, directories, quoted/dashed/newline paths, `/proc`, the timeout, abort, a non-zero exit, `cwd` and `env`, a VM paused mid-exec), checks reuse by id, and deletes the VM in `after` |
-| `cd examples/repo-agent && npm run smoke` | The example agent through Flue's real runtime (`start`, `init`, `dispatch`) on a real VM, with Pi's faux model provider replaying a scripted session of `bash`/`write`/`read` tool calls, then `release`; also checks that the adapter's errors are `instanceof` the app's own `FlueError` |
+| `cd examples/repo-agent && npm ci && npm run smoke` (after `npm ci` at the repository root) | The example agent through Flue's real runtime (`start`, `init`, `dispatch`) on a real VM, with Pi's faux model provider replaying a scripted session of `bash`/`write`/`read` tool calls, then `release`; also checks that the adapter's errors are `instanceof` the app's own `FlueError` |
 
 Tag test VMs so they are easy to find: the integration test tags its VM
 `flue-cove-test=1`, and the example takes extra tags from `REPO_AGENT_TAGS`.

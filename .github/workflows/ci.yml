@@ -26,3 +26,10 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      # The example installs flue-cove as a copy, built by the root's prepare
+      # script, so it needs the root's dev dependencies installed first.
+      # Typecheck only: no Cove server or model credentials are involved.
+      - run: npm ci
+        working-directory: examples/repo-agent
+      - run: npm run typecheck
+        working-directory: examples/repo-agent

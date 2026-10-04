@@ -47,6 +47,13 @@ errors with `instanceof`. `--install-links` (or `install-links=true` in your
 
 Node.js 22.19 or newer, ESM only (Flue's own requirements).
 
+**Cove server.** The file API (`HEAD`/`GET`/`PUT /api/vms/{name}/files`) needs
+a server build that includes Cove commit `537fb91a3` (the file-transfer
+endpoints), or the first release after `cove-server` 0.33.2; the 0.33.2 tag
+itself has no file routes. A pre-release build with them may still report
+version 0.33.2. Older servers work too, more slowly: the adapter notices that
+the route is missing and runs every file operation over exec.
+
 ## Configuration
 
 `fromEnv()`, and `coveVms()` when you pass no `client`, read:
@@ -193,13 +200,24 @@ to exec: a symlink anywhere in the path or a non-regular target (422
 `file_not_regular`), a path on the API's deny-list such as `/proc` (403
 `file_path_denied`), a guest agent that predates the API (409
 `guest_agent_too_old`), a key without `files:read`/`files:write` (403
-`scope_denied`), and a path the API's syntax rules reject (400). On
+`scope_denied`), a path the API's syntax rules reject (400), and a server
+without the file API at all (below). On
 Ubuntu `/bin`, `/lib` and `/sbin` are symlinks, so paths under them always use
 the fallback. 404 is `ENOENT`. 413 `file_too_large` is an error for
 `readFile`/`readFileBuffer`/`writeFile`; `stat` and `exists` fall back to exec
 on it, since a shell can still stat a file too big to transfer. A VM that is not running or is gone becomes Flue's
 `SandboxDiedError`, as does a `paused` event in the middle of an exec. 429
 (rate limit) and file-API 503 (`unavailable`) are retried with backoff.
+
+A server that predates the file API answers every `/files` request with its
+router's bare 404, which has no error code. The real route always names what
+is missing on a `GET` or `PUT` (`vm_not_found` or `file_not_found`), so a
+codeless 404 there means "no route". A `HEAD` error never has a body, so the
+first bare `HEAD` 404 is checked once per driver with a probe: `HEAD` of the
+path `/`, which the route refuses with 400 before touching the guest and an
+old server answers with the same bare 404. Once the route is known to be
+missing, every file operation runs over exec. `CoveSandboxDriver.fileRoute`
+reports what the driver found.
 
 Every option Flue defines (`exec`'s `cwd`, `env`, `timeoutMs`, `signal`;
 `mkdir`'s `recursive`; `rm`'s `recursive` and `force`) is honoured exactly. An
@@ -212,7 +230,7 @@ are safe.
 
 ## Limitations
 
-These were measured against a Cove 0.33.2 server.
+These were measured against a Cove server built after 0.33.2 that includes the file API (it reports version 0.33.2).
 
 - **Shell.** Commands run under `bash` when the guest has it (so `[[ ]]` and
   `set -o pipefail` work), otherwise under `sh`.

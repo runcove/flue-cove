@@ -28,8 +28,14 @@ Why a vendored file and not a URL: a Cove server publishes its SDK only on its
 own host, which CI cannot reach, and a URL would put a deployment's hostname
 into `package.json` and the lockfile.
 
-The file API itself is served by Cove servers from 0.33.2 (API version 6); the
-SDK commit above adds only the client methods for it.
+The SDK commit above adds only the client methods. The file API itself is a
+server feature that is newer than the last tagged release, `cove-server`
+0.33.2: that tag has no file routes. A server needs a build that includes
+Cove commit `537fb91a3` (the file-transfer endpoints), or the first release
+after 0.33.2. Such a build may still report its version as 0.33.2, so the
+version string does not tell. Against an older server the adapter detects
+the missing route and moves all file content over exec (see the main
+README).
 
 ## Upgrading
 

@@ -586,15 +586,21 @@ describe("fallback rules, one per refusal", () => {
   });
 
   it("HEAD 404 has no code, so it reads as a missing file even if the VM is gone", async () => {
-    // A HEAD error has no body: vm_not_found and file_not_found are both a bare 404.
-    const { driver, calls } = setup({ stat: apiError(404) });
+    // A HEAD error has no body: vm_not_found and file_not_found are both a
+    // bare 404. The route itself exists: its probe of `/` answers 400.
+    const shell = localShellClient();
+    const fake = fsFiles();
+    fake.files.stat = async (_vm, path) => {
+      throw path === "/" ? apiError(400) : apiError(404);
+    };
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
     await assert.rejects(driver.stat(join(dir, "f")), (err: unknown) => {
       assert.equal((err as { code?: string }).code, "ENOENT");
       assert.ok(!(err instanceof SandboxDiedError));
       return true;
     });
     assert.equal(await driver.exists(join(dir, "f")), false);
-    assert.equal(calls.length, 0);
+    assert.equal(shell.calls.length, 0);
   });
 
   it("a short body is a failed read: not retried, no exec fallback", async () => {
@@ -611,5 +617,114 @@ describe("fallback rules, one per refusal", () => {
     await assert.rejects(driver.readFileBuffer(join(dir, "f")), DownloadTruncatedError);
     assert.equal(n, 1);
     assert.equal(shell.calls.length, 0);
+  });
+});
+
+describe("a server without the file route", () => {
+  /**
+   * A server that predates the file API answers every /files request with
+   * its router's bare 404: no body, so no code, for GET, PUT and HEAD alike.
+   */
+  function noRoute() {
+    const used: string[] = [];
+    const bare = () => apiError(404);
+    const files: CoveFiles = {
+      stat: async (_vm, path) => {
+        used.push(`stat ${path}`);
+        throw bare();
+      },
+      download: async (_vm, path) => {
+        used.push(`download ${path}`);
+        throw bare();
+      },
+      downloadBytes: async (_vm, path) => {
+        used.push(`download ${path}`);
+        throw bare();
+      },
+      upload: async (_vm, path) => {
+        used.push(`upload ${path}`);
+        throw bare();
+      },
+    };
+    const shell = localShellClient();
+    return {
+      driver: new CoveSandboxDriver(shell.client, "vm", { files }),
+      used,
+      calls: shell.calls,
+    };
+  }
+
+  it("a GET 404 with no code means no route: read over exec, then skip the API", async () => {
+    const { driver, used } = noRoute();
+    writeFileSync(join(dir, "f"), "old server");
+    assert.equal(await driver.readFile(join(dir, "f")), "old server");
+    assert.equal(await driver.readFile(join(dir, "f")), "old server");
+    assert.equal(await driver.exists(join(dir, "f")), true);
+    assert.equal((await driver.stat(join(dir, "f"))).size, 10);
+    await driver.writeFile(join(dir, "g"), "written");
+    assert.equal(readFileSync(join(dir, "g"), "utf8"), "written");
+    assert.deepEqual(used, [`download ${dir}/f`]);
+  });
+
+  it("a PUT 404 with no code means no route: write over exec", async () => {
+    const { driver, used } = noRoute();
+    await driver.writeFile(join(dir, "w"), "via exec");
+    assert.equal(readFileSync(join(dir, "w"), "utf8"), "via exec");
+    assert.equal(await driver.readFile(join(dir, "w")), "via exec");
+    assert.deepEqual(used, [`upload ${dir}/w`]);
+  });
+
+  it("a HEAD 404 is checked once with a probe of '/': no route, so stat and exists use exec", async () => {
+    const { driver, used } = noRoute();
+    writeFileSync(join(dir, "f"), "abc");
+    assert.equal((await driver.stat(join(dir, "f"))).size, 3);
+    assert.equal(await driver.exists(join(dir, "f")), true);
+    assert.equal(await driver.exists(join(dir, "nope")), false);
+    assert.deepEqual(used, [`stat ${dir}/f`, "stat /"]);
+  });
+
+  it("concurrent first calls share one probe", async () => {
+    const { driver, used } = noRoute();
+    writeFileSync(join(dir, "f"), "abc");
+    await Promise.all([driver.stat(join(dir, "f")), driver.exists(join(dir, "f"))]);
+    assert.equal(used.filter((u) => u === "stat /").length, 1);
+  });
+});
+
+describe("a server with the file route", () => {
+  it("a HEAD 404 is probed once; the probe's 400 confirms the route, so it is ENOENT", async () => {
+    const shell = localShellClient();
+    const fake = fsFiles();
+    const stat = fake.files.stat;
+    fake.files.stat = async (vm, path, opts) => {
+      // The route refuses `/` lexically (an empty component) with 400.
+      if (path === "/") {
+        fake.used.push("stat /");
+        throw apiError(400);
+      }
+      return stat(vm, path, opts);
+    };
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+    await assert.rejects(driver.stat(join(dir, "nope")), { code: "ENOENT" });
+    assert.equal(await driver.exists(join(dir, "nope2")), false);
+    await assert.rejects(driver.stat(join(dir, "nope3")), { code: "ENOENT" });
+    assert.equal(fake.used.filter((u) => u === "stat /").length, 1);
+    assert.equal(shell.calls.length, 0);
+  });
+
+  it("a successful call proves the route: a later HEAD 404 needs no probe", async () => {
+    const { driver, used } = setup();
+    writeFileSync(join(dir, "f"), "x");
+    await driver.stat(join(dir, "f"));
+    await assert.rejects(driver.stat(join(dir, "nope")), { code: "ENOENT" });
+    assert.ok(!used.includes("stat /"));
+  });
+
+  it("a GET 404 file_not_found is ENOENT, never mistaken for a missing route", async () => {
+    const { driver, used } = setup();
+    await assert.rejects(driver.readFile(join(dir, "nope")), { code: "ENOENT" });
+    writeFileSync(join(dir, "f"), "x");
+    await driver.readFile(join(dir, "f"));
+    assert.equal(used.filter((u) => u.startsWith("download")).length, 2);
   });
 });

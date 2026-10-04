@@ -12,7 +12,7 @@ import { after, before, describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { CoveClient } from "@cove/sdk";
 import { type Sandbox, SandboxDiedError } from "@flue/runtime";
-import { cove, coveVms, fromEnv } from "../../src/index.ts";
+import { CoveSandboxDriver, cove, coveVms, filesFor, fromEnv } from "../../src/index.ts";
 
 const enabled =
   !!process.env.COVE_API_URL && !!(process.env.COVE_API_KEY || process.env.COVE_API_KEY_FILE);
@@ -195,6 +195,22 @@ describe("Cove integration", {
 
   it("reads a pseudo-file the file API refuses (403 deny-list) over exec", async () => {
     assert.match(await sandbox.readFile("/proc/self/status"), /^Name:/m);
+  });
+
+  it("the file route is detected: probing `/` answers 400, so a HEAD 404 is ENOENT, not exec", async () => {
+    // What the probe relies on: the route refuses `/` lexically with 400.
+    const probe = await client.vms.files.stat(vm, "/").then(
+      () => "200",
+      (err: { status?: number; code?: string }) => `${err.status} ${err.code ?? "(no code)"}`,
+    );
+    console.log(`# probe HEAD ${vm} path=/ -> ${probe}`);
+    assert.match(probe, /^400\b/);
+    const driver = new CoveSandboxDriver(client, vm, { files: filesFor(client) });
+    assert.equal(driver.fileRoute, "unknown");
+    await assert.rejects(driver.stat("/workspace/no-such-file"), { code: "ENOENT" });
+    assert.equal(await driver.exists("/workspace/no-such-file"), false);
+    console.log(`# driver.fileRoute after a HEAD 404 -> ${driver.fileRoute}`);
+    assert.equal(driver.fileRoute, "present");
   });
 
   it("cove(): the pure adapter on the same VM, with live output", async () => {

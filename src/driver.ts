@@ -236,6 +236,14 @@ export class CoveSandboxDriver implements SandboxDriver {
   /** The key lacks files:read (or files:write): skip the API from then on. */
   #readScopeDenied = false;
   #writeScopeDenied = false;
+  /**
+   * Whether the server serves the file API at all. Its routes are newer than
+   * some servers still in use, which answer every `/files` request with
+   * their router's bare 404. `unknown` until a call proves it either way.
+   */
+  #fileRoute: "unknown" | "present" | "absent" = "unknown";
+  /** The one in-flight probe for {@link #fileRoute}, shared by concurrent callers. */
+  #routeProbe: Promise<"unknown" | "present" | "absent"> | undefined;
 
   constructor(client: CoveExecClient, vm: string, options: CoveDriverOptions = {}) {
     this.#client = client;
@@ -248,6 +256,15 @@ export class CoveSandboxDriver implements SandboxDriver {
   /** The VM this driver targets. */
   get vm(): string {
     return this.#vm;
+  }
+
+  /**
+   * What the driver knows about the server's file route: `present`,
+   * `absent` (file operations then run over exec), or `unknown` until a
+   * file-API call or the route probe has answered.
+   */
+  get fileRoute(): "unknown" | "present" | "absent" {
+    return this.#fileRoute;
   }
 
   // ─── exec ────────────────────────────────────────────────────────────────
@@ -466,6 +483,45 @@ export class CoveSandboxDriver implements SandboxDriver {
     return res.stdout;
   }
 
+  /** The file client for reads (stat, download) or writes, or `undefined` to use exec. */
+  #filesFor(direction: "read" | "write"): CoveFiles | undefined {
+    if (this.#fileRoute === "absent") return undefined;
+    if (direction === "read" ? this.#readScopeDenied : this.#writeScopeDenied) return undefined;
+    return this.#files;
+  }
+
+  /** A file-API call that answered: the route exists. */
+  #routeSeen(): void {
+    this.#fileRoute = "present";
+  }
+
+  /**
+   * Whether the server lacks the file route, for a HEAD that answered a bare
+   * 404. A HEAD error has no body, so that 404 may be a missing file, a
+   * missing VM or a missing route. A server with the route answers 404 only
+   * after it has found the VM, and refuses the path `/` (an empty component)
+   * with 400 before any guest call; a server without it answers its
+   * router's bare 404 to that probe too. Probed once per driver. A probe that
+   * gets no HTTP answer decides nothing and is tried again next time.
+   */
+  async #routeAbsent(files: CoveFiles): Promise<boolean> {
+    if (this.#fileRoute !== "unknown") return this.#fileRoute === "absent";
+    this.#routeProbe ??= (async () => {
+      try {
+        await withRateLimitRetry(() => files.stat(this.#vm, "/"), FILE_RETRY);
+        return "present" as const;
+      } catch (err) {
+        const http = apiErrorStatus(err);
+        if (!http) return "unknown" as const;
+        return http.status === 404 && http.code === undefined ? "absent" : "present";
+      }
+    })();
+    const found = await this.#routeProbe;
+    this.#routeProbe = undefined;
+    if (found !== "unknown" && this.#fileRoute === "unknown") this.#fileRoute = found;
+    return this.#fileRoute === "absent";
+  }
+
   /** Classify a file-API failure: rethrow as the right error, or return to fall back. */
   #fileFailure(
     err: unknown,
@@ -475,6 +531,15 @@ export class CoveSandboxDriver implements SandboxDriver {
   ): void {
     const http = fileErrorStatus(err);
     if (!http) throw err;
+    // Only the file route's own handlers send a code.
+    if (http.code !== undefined) this.#routeSeen();
+    // A GET or PUT 404 from a server with the file route always names what is
+    // missing (`vm_not_found` or `file_not_found`); one with no code is the
+    // router of a server that predates the route. Use exec from now on.
+    if (op !== "stat" && http.status === 404 && http.code === undefined) {
+      this.#fileRoute = "absent";
+      return;
+    }
     if (vmGone(http.status, http.code)) throw died(operation);
     // A HEAD 404 has no code, so it may also mean the VM is gone; reporting
     // ENOENT then is the closest honest answer (the next exec will say more).
@@ -493,10 +558,15 @@ export class CoveSandboxDriver implements SandboxDriver {
   }
 
   async readFileBuffer(path: string): Promise<Uint8Array> {
-    const files = this.#readScopeDenied ? undefined : this.#files;
+    const files = this.#filesFor("read");
     if (files) {
       try {
-        return await withRateLimitRetry(() => files.downloadBytes(this.#vm, path), FILE_RETRY);
+        const bytes = await withRateLimitRetry(
+          () => files.downloadBytes(this.#vm, path),
+          FILE_RETRY,
+        );
+        this.#routeSeen();
+        return bytes;
       } catch (err) {
         this.#fileFailure(err, "download", "readFile", path);
       }
@@ -506,10 +576,11 @@ export class CoveSandboxDriver implements SandboxDriver {
 
   async writeFile(path: string, content: string | Uint8Array): Promise<void> {
     const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
-    const files = this.#writeScopeDenied ? undefined : this.#files;
+    const files = this.#filesFor("write");
     if (files) {
       try {
         await withRateLimitRetry(() => files.upload(this.#vm, path, bytes), FILE_RETRY);
+        this.#routeSeen();
         return;
       } catch (err) {
         this.#fileFailure(err, "upload", "writeFile", path);
@@ -550,17 +621,21 @@ export class CoveSandboxDriver implements SandboxDriver {
   }
 
   async stat(path: string): Promise<FileStat> {
-    const files = this.#readScopeDenied ? undefined : this.#files;
+    const files = this.#filesFor("read");
     if (files) {
       try {
         const info = await withRateLimitRetry(() => files.stat(this.#vm, path), FILE_RETRY);
+        this.#routeSeen();
         // A 200 means a regular file with no symlink anywhere in its path.
         // HEAD carries no modification time, so mtime is left out (runcove-1cl10).
         const st: FileStat = { isFile: true, isDirectory: false, isSymbolicLink: false };
         if (Number.isFinite(info.size)) st.size = info.size;
         return st;
       } catch (err) {
-        this.#fileFailure(err, "stat", "stat", path);
+        // A bare HEAD 404 on a server without the file route: ask the shell.
+        if (!(isBare404(err) && (await this.#routeAbsent(files)))) {
+          this.#fileFailure(err, "stat", "stat", path);
+        }
       }
     }
     const out = (await this.#must("stat", path, ["sh", "-c", STAT, "sh", path])).trim();
@@ -583,15 +658,19 @@ export class CoveSandboxDriver implements SandboxDriver {
 
   async exists(path: string): Promise<boolean> {
     try {
-      const files = this.#readScopeDenied ? undefined : this.#files;
+      const files = this.#filesFor("read");
       if (files) {
         try {
           await withRateLimitRetry(() => files.stat(this.#vm, path), FILE_RETRY);
+          this.#routeSeen();
           return true;
         } catch (err) {
           // 404 (file or, for a HEAD, possibly the VM: HEAD errors carry no
-          // code, runcove-1cl10) reads as "not there".
-          if (fileErrorStatus(err)?.status === 404) return false;
+          // code, runcove-1cl10) reads as "not there", unless the server has
+          // no file route at all, which the shell then answers for.
+          if (fileErrorStatus(err)?.status === 404 && !(await this.#routeAbsent(files))) {
+            return false;
+          }
           // Anything else (directory, symlink, denied, transport): ask the shell.
         }
       }
@@ -628,6 +707,12 @@ export class CoveSandboxDriver implements SandboxDriver {
     const flags = `${options?.recursive ? "r" : ""}${options?.force ? "f" : ""}`;
     await this.#must("rm", path, flags ? ["rm", `-${flags}`, "--", path] : ["rm", "--", path]);
   }
+}
+
+/** A 404 with no code: what a HEAD error (no body) or a missing route answers. */
+function isBare404(err: unknown): boolean {
+  const http = fileErrorStatus(err);
+  return http?.status === 404 && http.code === undefined;
 }
 
 function withNote(stderr: string, note: string): string {

@@ -486,3 +486,33 @@ describe("options the contract does not define", () => {
     assert.ok(statSync(join(dir, "ok/nested")).isDirectory());
   });
 });
+
+describe("a key without files:* scopes (403 scope_denied)", () => {
+  it("GET 403 scope_denied falls back to exec, and later reads skip the API", async () => {
+    const { driver, used, calls } = setup({
+      download: new CoveFileError(403, "scope_denied", "key lacks files:read"),
+    });
+    writeFileSync(join(dir, "a"), "one");
+    writeFileSync(join(dir, "b"), "two");
+    assert.equal(await driver.readFile(join(dir, "a")), "one");
+    assert.equal(await driver.readFile(join(dir, "b")), "two");
+    assert.equal(used.filter((u) => u.startsWith("download")).length, 1);
+    assert.equal(calls.length, 2);
+    // A read refusal says nothing about stat via HEAD: same scope, so skip it too.
+    await driver.stat(join(dir, "a"));
+    assert.equal(used.filter((u) => u.startsWith("stat")).length, 0);
+  });
+
+  it("PUT 403 scope_denied falls back to exec, and later writes skip the API", async () => {
+    const { driver, used } = setup({
+      upload: new CoveFileError(403, "scope_denied", "key lacks files:write"),
+    });
+    await driver.writeFile(join(dir, "w1"), "x");
+    await driver.writeFile(join(dir, "w2"), "y");
+    assert.equal(readFileSync(join(dir, "w2"), "utf8"), "y");
+    assert.equal(used.filter((u) => u.startsWith("upload")).length, 1);
+    // Reads still use the API: files:read may be granted on its own.
+    assert.equal(await driver.readFile(join(dir, "w1")), "x");
+    assert.equal(used.filter((u) => u.startsWith("download")).length, 1);
+  });
+});

@@ -35,6 +35,9 @@ import {
 /** File-API calls retry 429s and 503 `unavailable` a few times. */
 const FILE_RETRY = { retryOn: isTransientFileError, attempts: 4 };
 
+/** The longest delay setTimeout honours. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
 /** Retries of an exec refused with 429 before it gives up. */
 const RATE_LIMIT_RETRIES = 7;
 
@@ -83,24 +86,41 @@ export function timeoutSecsFor(timeoutMs: number | undefined): number | undefine
 const WRITE_CHUNK_BYTES = 64 * 1024;
 
 /**
- * Runs the user's script as the leader of a new process group (`setsid -w`
- * when the guest has it), writing that leader's pid to a file so the group
- * can be killed later. Cove's own timeout and a dropped stream both leave
- * descendants running; the group kill is what makes `timeoutMs` and abort
- * actually stop the command. `$1` = inner script, `$2` = pid file, `$3` = user script.
+ * Runs the user's script under bash when the guest has it (else sh), as the
+ * leader of a new process group (`setsid -w`) when the guest has setsid,
+ * recording `<mode> <pid> <starttime>` in a pid file so the command can be
+ * killed later: mode `g` means the pid is a process-group id, `p` a lone pid.
+ * Cove's own timeout kills only the direct child and an aborted request kills
+ * nothing (runcove-cw62w, runcove-ckxuu); the group kill is what makes
+ * `timeoutMs` and abort actually stop the command.
+ * `$1` = inner script, `$2` = pid file, `$3` = user script.
  */
 const LAUNCH =
-  'if setsid -w true 2>/dev/null; then exec setsid -w sh -c "$1" sh "$2" "$3"; else exec sh -c "$1" sh "$2" "$3"; fi';
+  "if command -v bash >/dev/null 2>&1; then s=bash; else s=sh; fi; " +
+  'if setsid -w true 2>/dev/null; then exec setsid -w "$s" -c "$1" "$s" "$2" "$3" g; ' +
+  'else exec "$s" -c "$1" "$s" "$2" "$3" p; fi';
 const INNER =
-  "__flue_cove_pidfile=$1; __flue_cove_cmd=$2; shift 2; " +
-  '{ echo $$ > "$__flue_cove_pidfile"; } 2>/dev/null; ' +
+  "__flue_cove_pidfile=$1; __flue_cove_cmd=$2; __flue_cove_mode=$3; shift 3; " +
+  "{ __flue_cove_st=$(sed 's/^.*) //' /proc/$$/stat | cut -d' ' -f20); " +
+  'echo "$__flue_cove_mode $$ $__flue_cove_st" > "$__flue_cove_pidfile"; } 2>/dev/null; ' +
   "trap 'rm -f -- \"$__flue_cove_pidfile\"' EXIT; " +
   'eval "$__flue_cove_cmd"';
-/** Kill the group recorded in pid file `$1` (or the lone process without setsid), then drop the file. */
-const KILL_GROUP =
-  'p=$(cat -- "$1" 2>/dev/null); rm -f -- "$1"; ' +
+/**
+ * Kill what pid file `$1` records, then drop the file. Waits up to ~1 s for
+ * the file (an abort can race the command's start). A recorded pid that is
+ * alive but has a different start time is a recycled pid: leave it alone. A
+ * group id whose leader is gone is still safe to signal: the kernel does not
+ * hand out a pid that is still in use as a process-group id.
+ */
+export const KILL_GROUP =
+  'i=0; while [ ! -e "$1" ] && [ "$i" -lt 5 ]; do sleep 0.2; i=$((i+1)); done; ' +
+  'read -r m p t < "$1" 2>/dev/null; rm -f -- "$1"; ' +
   'case $p in ""|*[!0-9]*) exit 0;; esac; [ "$p" -gt 1 ] || exit 0; ' +
-  'kill -s KILL -- "-$p" 2>/dev/null || kill -s KILL "$p" 2>/dev/null; exit 0';
+  'if [ -r "/proc/$p/stat" ]; then ' +
+  "cur=$(sed 's/^.*) //' \"/proc/$p/stat\" | cut -d' ' -f20); " +
+  '[ -z "$t" ] || [ "$cur" = "$t" ] || exit 0; ' +
+  'elif [ "$m" != g ]; then exit 0; fi; ' +
+  'if [ "$m" = g ]; then kill -s KILL -- "-$p" 2>/dev/null; else kill -s KILL "$p" 2>/dev/null; fi; exit 0';
 
 const READ_B64 = 'base64 < "$1"';
 const WRITE_ONE = 'printf %s "$1" | base64 -d > "$2"';
@@ -185,8 +205,10 @@ function canFallBack(
     case 400: // a path the API's syntax rules refuse (e.g. "/")
     case 422: // symlink in the path, directory, special file
       return true;
-    case 403:
-      return err.code === undefined || err.code === "file_path_denied";
+    case 403: // deny-listed path, or a key without files:read / files:write
+      return (
+        err.code === undefined || err.code === "file_path_denied" || err.code === "scope_denied"
+      );
     case 409:
       return err.code === undefined || err.code === "guest_agent_too_old";
     case 413: // HEAD of a file over the transfer cap: the shell can still stat it
@@ -208,6 +230,9 @@ export class CoveSandboxDriver implements SandboxDriver {
   readonly #files: CoveFiles | undefined;
   readonly #onOutput: CoveDriverOptions["onOutput"];
   readonly #secrets: InjectSelector | undefined;
+  /** The key lacks files:read (or files:write): skip the API from then on. */
+  #readScopeDenied = false;
+  #writeScopeDenied = false;
 
   constructor(client: CoveExecClient, vm: string, options: CoveDriverOptions = {}) {
     this.#client = client;
@@ -293,21 +318,29 @@ export class CoveSandboxDriver implements SandboxDriver {
   ): Promise<ShellResult> {
     const selector = this.#secrets as InjectSelector;
     let timedOut = false;
-    const timer =
-      options.timeoutMs !== undefined
-        ? setTimeout(() => {
-            timedOut = true;
-            void this.#killGroup(pidFile);
-          }, options.timeoutMs)
-        : undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // setTimeout fires at once for delays beyond 2^31-1 ms; clamp instead.
+    const delay =
+      options.timeoutMs === undefined
+        ? undefined
+        : Math.min(Math.max(0, options.timeoutMs), MAX_TIMER_MS);
     try {
       const out = await withRateLimitRetry(
-        () =>
-          this.#client.vms.execWithSecrets(
+        () => {
+          // The deadline starts when a request goes out: a 429'd attempt ran nothing.
+          clearTimeout(timer);
+          if (delay !== undefined) {
+            timer = setTimeout(() => {
+              timedOut = true;
+              void this.#killGroup(pidFile);
+            }, delay);
+          }
+          return this.#client.vms.execWithSecrets(
             this.#vm,
             { command: argv, selector },
             options.signal ? { signal: options.signal } : {},
-          ),
+          );
+        },
         options.signal ? { signal: options.signal } : {},
       );
       if (timedOut) {
@@ -330,10 +363,11 @@ export class CoveSandboxDriver implements SandboxDriver {
 
   /** Map an exec failure; on a caller abort, also kill the orphaned guest command. */
   #execFailure(err: unknown, pidFile: string, signal: AbortSignal | undefined): unknown {
-    if (signal?.aborted) {
-      // Cove does not stop a command when its request goes away. Kill the
-      // group out of band; the caller has already been released by Flue's
-      // abort race, so nobody waits on this.
+    // Cove does not stop a command when its request goes away (runcove-ckxuu):
+    // on a caller abort, or the SDK's own request deadline (TimeoutError),
+    // kill the group out of band. The caller has already been released, so
+    // nobody waits on this.
+    if (signal?.aborted || (err instanceof Error && err.name === "TimeoutError")) {
       void this.#killGroup(pidFile);
       return err;
     }
@@ -429,6 +463,10 @@ export class CoveSandboxDriver implements SandboxDriver {
     // A HEAD 404 has no code, so it may also mean the VM is gone; reporting
     // ENOENT then is the closest honest answer (the next exec will say more).
     if (http.status === 404) throw fsError("ENOENT", operation, path, "no such file or directory");
+    if (http.status === 403 && http.code === "scope_denied") {
+      if (op === "upload") this.#writeScopeDenied = true;
+      else this.#readScopeDenied = true;
+    }
     if (!canFallBack(http, op)) throw err;
   }
 
@@ -439,7 +477,7 @@ export class CoveSandboxDriver implements SandboxDriver {
   }
 
   async readFileBuffer(path: string): Promise<Uint8Array> {
-    const files = this.#files;
+    const files = this.#readScopeDenied ? undefined : this.#files;
     if (files) {
       try {
         return await withRateLimitRetry(() => files.downloadBytes(this.#vm, path), FILE_RETRY);
@@ -452,7 +490,7 @@ export class CoveSandboxDriver implements SandboxDriver {
 
   async writeFile(path: string, content: string | Uint8Array): Promise<void> {
     const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
-    const files = this.#files;
+    const files = this.#writeScopeDenied ? undefined : this.#files;
     if (files) {
       try {
         await withRateLimitRetry(() => files.upload(this.#vm, path, bytes), FILE_RETRY);
@@ -496,7 +534,7 @@ export class CoveSandboxDriver implements SandboxDriver {
   }
 
   async stat(path: string): Promise<FileStat> {
-    const files = this.#files;
+    const files = this.#readScopeDenied ? undefined : this.#files;
     if (files) {
       try {
         const info = await withRateLimitRetry(() => files.stat(this.#vm, path), FILE_RETRY);
@@ -529,7 +567,7 @@ export class CoveSandboxDriver implements SandboxDriver {
 
   async exists(path: string): Promise<boolean> {
     try {
-      const files = this.#files;
+      const files = this.#readScopeDenied ? undefined : this.#files;
       if (files) {
         try {
           await withRateLimitRetry(() => files.stat(this.#vm, path), FILE_RETRY);

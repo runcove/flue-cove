@@ -1,12 +1,18 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { ConflictError, NotFoundError } from "@cove/sdk";
 import { SandboxDiedError, sandboxFromDriver } from "@flue/runtime";
-import { CoveSandboxDriver, timeoutSecsFor } from "../src/driver.ts";
+import {
+  type CoveExecClient,
+  CoveSandboxDriver,
+  KILL_GROUP,
+  timeoutSecsFor,
+} from "../src/driver.ts";
 import { localShellClient, scriptedClient } from "./helpers.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "flue-cove-exec-"));
@@ -239,5 +245,125 @@ describe("exec: secrets", () => {
     const ac = new AbortController();
     await driver.exec("true", { signal: ac.signal });
     assert.equal(secretsCalls[0]?.signal, ac.signal);
+  });
+});
+
+describe("exec: shell", () => {
+  it("runs the command under bash when the guest has it", async () => {
+    const { client } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm");
+    const res = await driver.exec(
+      '[[ "a b" == "a b" ]] && echo ok; set -o pipefail; false | true; echo "pipe=$?"',
+    );
+    assert.equal(res.stdout, "ok\npipe=1\n");
+    assert.equal(res.exitCode, 0);
+  });
+});
+
+describe("the group-kill helper", () => {
+  const run = (script: string, ...args: string[]) =>
+    new Promise<number>((resolve) => {
+      const child = spawn("sh", ["-c", script, "sh", ...args], { stdio: "ignore" });
+      child.on("close", (code) => resolve(code ?? -1));
+    });
+  const starttime = (pid: number) =>
+    readFileSync(`/proc/${pid}/stat`, "utf8")
+      .replace(/^.*\) /, "")
+      .split(" ")[19];
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  it("kills a recorded group even after its leader is gone", async () => {
+    const pidFile = join(dir, "g.pid");
+    // A new session whose leader exits at once, leaving a member running.
+    const leader = spawn(
+      "setsid",
+      ["sh", "-c", `echo "g $$ x" > '${pidFile}'; sleep 30 & exit 0`],
+      {
+        stdio: "ignore",
+      },
+    );
+    await new Promise((r) => leader.on("close", r));
+    const pgid = Number(readFileSync(pidFile, "utf8").split(" ")[1]);
+    assert.equal(await run(KILL_GROUP, pidFile), 0);
+    await sleep(200);
+    const out = execFileSync("ps", ["-eo", "pgid="], { encoding: "utf8" });
+    assert.ok(!out.split("\n").some((l) => Number(l.trim()) === pgid), "group survived");
+  });
+
+  it("does not kill a single pid whose start time no longer matches (pid reuse)", async () => {
+    const pidFile = join(dir, "p.pid");
+    const victim = spawn("sleep", ["30"], { stdio: "ignore" });
+    writeFileSync(pidFile, `p ${victim.pid} 1`);
+    await run(KILL_GROUP, pidFile);
+    await sleep(100);
+    assert.equal(alive(victim.pid as number), true);
+    victim.kill();
+  });
+
+  it("kills a single pid whose start time matches", async () => {
+    const pidFile = join(dir, "p2.pid");
+    const victim = spawn("sleep", ["30"], { stdio: "ignore" });
+    await sleep(50);
+    writeFileSync(pidFile, `p ${victim.pid} ${starttime(victim.pid as number)}`);
+    await run(KILL_GROUP, pidFile);
+    await new Promise((r) => victim.on("close", r));
+    assert.equal(alive(victim.pid as number), false);
+  });
+
+  it("waits briefly for a pid file that does not exist yet", async () => {
+    const pidFile = join(dir, "late.pid");
+    const victim = spawn("sleep", ["30"], { stdio: "ignore" });
+    await sleep(50);
+    setTimeout(
+      () => writeFileSync(pidFile, `p ${victim.pid} ${starttime(victim.pid as number)}`),
+      300,
+    );
+    await run(KILL_GROUP, pidFile);
+    await new Promise((r) => victim.on("close", r));
+    assert.equal(alive(victim.pid as number), false);
+  });
+
+  it("ignores garbage in the pid file", async () => {
+    const pidFile = join(dir, "bad.pid");
+    writeFileSync(pidFile, "g 1 x");
+    assert.equal(await run(KILL_GROUP, pidFile), 0);
+    writeFileSync(pidFile, "g $(id) x");
+    assert.equal(await run(KILL_GROUP, pidFile), 0);
+  });
+});
+
+describe("exec: secrets timers", () => {
+  it("a timeoutMs beyond setTimeout's range does not fire at once", async () => {
+    const { client } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm", { secrets: { kind: "all" } });
+    const res = await driver.exec("sleep 0.3; echo done", { timeoutMs: 2 ** 40 });
+    assert.deepEqual(res, { stdout: "done\n", stderr: "", exitCode: 0 });
+  });
+
+  it("an SDK request timeout (TimeoutError) also kills the guest command", async () => {
+    const marker = join(dir, "sdk-timeout-marker");
+    const shell = localShellClient();
+    const client = {
+      vms: {
+        exec: shell.client.vms.exec,
+        execWithSecrets: async (vm: string, opts: { command: string[] }) => {
+          // Start the command, then fail the request the way the SDK's deadline does.
+          void shell.client.vms.execWithSecrets(vm, { ...opts, selector: { kind: "all" } });
+          await sleep(300);
+          throw new DOMException("Request timed out after 300 ms", "TimeoutError");
+        },
+      },
+    } as unknown as CoveExecClient;
+    const driver = new CoveSandboxDriver(client, "vm", { secrets: { kind: "all" } });
+    await assert.rejects(driver.exec(`sleep 2; touch '${marker}'`), { name: "TimeoutError" });
+    await sleep(2500);
+    assert.equal(existsSync(marker), false);
   });
 });

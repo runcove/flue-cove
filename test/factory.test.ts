@@ -5,6 +5,7 @@ import {
   ConflictError,
   CoveAPIError,
   CoveConnectionError,
+  CoveError,
   type CreateVmRequest,
   type ExecEvent,
   NotFoundError,
@@ -45,6 +46,7 @@ function fakeCove(
   const creates: CreateVmRequest[] = [];
   const execs: Array<{ vm: string; command: string[] }> = [];
   let seq = 0;
+  const waits: number[] = [];
 
   const get = async (name: string) => {
     const vm = vms.get(name);
@@ -85,10 +87,14 @@ function fakeCove(
         return { name };
       },
       get,
-      async waitForState(name, states) {
+      async waitForState(name, states, o) {
+        // Like the SDK: poll get(), throw a CoveError once timeoutMs is spent.
+        const deadline = Date.now() + (o?.timeoutMs ?? 300_000);
+        waits.push(o?.timeoutMs ?? 300_000);
         for (;;) {
           const vm = await get(name);
           if (states.includes(vm.state)) return vm;
+          if (Date.now() >= deadline) throw new CoveError(`VM ${name} still ${vm.state}`);
           await sleep(2);
         }
       },
@@ -132,7 +138,7 @@ function fakeCove(
       },
     },
   };
-  return { client, vms, log, creates, execs };
+  return { client, vms, log, creates, execs, waits };
 }
 
 const noFiles: CoveFiles = {
@@ -366,6 +372,37 @@ describe("coveVms: tags and races", () => {
       /revive/,
     );
     assert.ok(starts > 1 && starts <= 4, `starts=${starts}`);
+  });
+
+  it("readyTimeoutMs is one overall budget, not one per wait", async () => {
+    const fake = fakeCove();
+    fake.vms.set("old", { name: "old", state: "stopped", tags: { "flue-id": "slow" } });
+    fake.client.vms.start = async () => {
+      throw new ConflictError(409, "invalid state transition", "invalid_state_transition");
+    };
+    const started = Date.now();
+    await assert.rejects(
+      coveVms({ client: fake.client, files: noFiles, readyTimeoutMs: 300 }).createSandbox({
+        id: "slow",
+      }),
+      /ready/,
+    );
+    const took = Date.now() - started;
+    assert.ok(took < 800, `took ${took} ms for a 300 ms budget`);
+    assert.ok(
+      fake.waits.every((w) => w <= 300),
+      `every wait gets at most the remaining budget: ${fake.waits}`,
+    );
+  });
+
+  it("a candidate deleted while being revived is skipped, and a new VM is created", async () => {
+    const fake = fakeCove();
+    fake.vms.set("going", { name: "going", state: "stopping", tags: { "flue-id": "gone" } });
+    setTimeout(() => fake.vms.delete("going"), 10);
+    const factory = coveVms({ client: fake.client, files: noFiles });
+    await factory.createSandbox({ id: "gone" });
+    assert.equal(fake.creates.length, 1);
+    assert.equal(factory.vmName("gone"), "vm-1");
   });
 
   it("releaseAll also deletes a VM whose create response was lost", async () => {

@@ -127,7 +127,10 @@ export interface CoveVmsOptions extends CoveSandboxOptions {
   initialSecrets?: SecretSpec[];
   /** Find an existing VM tagged with the id before creating one. Default `true`. */
   reuse?: boolean;
-  /** How long to wait for a VM to reach `running`. Default 300 000 ms. */
+  /**
+   * Overall budget for a VM to become ready: one deadline for the whole
+   * `createSandbox` (finding, reviving, creating), not per wait. Default 300 000 ms.
+   */
   readyTimeoutMs?: number;
   /**
    * How long to wait, once a new VM is running, for Cove to apply its initial
@@ -239,12 +242,37 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
     });
   }
 
-  async function waitRunning(name: string): Promise<void> {
-    const vm = await rl(() =>
-      getClient().vms.waitForState(name, ["running", "failed", "deleted"], {
-        timeoutMs: readyTimeoutMs,
-      }),
-    );
+  /**
+   * One readiness budget per provisioning: every wait gets only what is left
+   * of it, re-read on each attempt so 429 retries cannot stretch it.
+   */
+  function budget(id: string) {
+    const deadline = Date.now() + readyTimeoutMs;
+    const left = (): number => {
+      const ms = deadline - Date.now();
+      if (ms <= 0) {
+        throw new Error(
+          `no Cove VM for ${idTag}=${id} was ready within readyTimeoutMs (${readyTimeoutMs} ms)`,
+        );
+      }
+      return ms;
+    };
+    return left;
+  }
+
+  async function waitFor(name: string, states: VmState[], left: () => number) {
+    const vms = getClient().vms;
+    try {
+      return await rl(() => vms.waitForState(name, states, { timeoutMs: left() }));
+    } catch (err) {
+      if (err instanceof NotFoundError) throw err;
+      left(); // turn a budget overrun into the readiness error
+      throw err;
+    }
+  }
+
+  async function waitRunning(name: string, left: () => number): Promise<void> {
+    const vm = await waitFor(name, ["running", "failed", "deleted"], left);
     if (vm.state !== "running") {
       throw new Error(`Cove VM ${name} did not reach running (state: ${vm.state})`);
     }
@@ -254,7 +282,20 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
   const SETTLED: VmState[] = ["running", "stopped", "paused", "hibernated", "failed", "deleted"];
   const MAX_REVIVE_ROUNDS = 3;
 
-  async function revive(vm: VmSummary, round = 0): Promise<boolean> {
+  /**
+   * Bring a found VM to running. `false` means it cannot be used (a state
+   * that does not revive, or it was deleted meanwhile): try the next one.
+   */
+  async function revive(vm: VmSummary, left: () => number, round = 0): Promise<boolean> {
+    try {
+      return await reviveOnce(vm, left, round);
+    } catch (err) {
+      if (err instanceof NotFoundError) return false;
+      throw err;
+    }
+  }
+
+  async function reviveOnce(vm: VmSummary, left: () => number, round: number): Promise<boolean> {
     if (round > MAX_REVIVE_ROUNDS) {
       throw new Error(
         `could not revive Cove VM ${vm.name}: it was still changing state after ${MAX_REVIVE_ROUNDS} retries`,
@@ -264,11 +305,9 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
     if (!how) return false;
     const vms = getClient().vms;
     if (how === "wait") {
-      const settled = await rl(() =>
-        vms.waitForState(vm.name, SETTLED, { timeoutMs: readyTimeoutMs }),
-      );
+      const settled = await waitFor(vm.name, SETTLED, left);
       if (settled.state === "running") return true;
-      return revive({ ...vm, state: settled.state }, round + 1);
+      return reviveOnce({ ...vm, state: settled.state }, left, round + 1);
     }
     try {
       if (how === "start") await rl(() => vms.start(vm.name));
@@ -280,26 +319,25 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
       // hibernating it). Give that transition a moment (Cove has no
       // "starting" state, so a VM being started can still read "stopped"),
       // wait until it settles, then revive from there.
-      await new Promise((r) => setTimeout(r, 250 * (round + 1)));
-      const settled = await rl(() =>
-        vms.waitForState(vm.name, SETTLED, { timeoutMs: readyTimeoutMs }),
-      );
+      await new Promise((r) => setTimeout(r, Math.min(250 * (round + 1), left())));
+      const settled = await waitFor(vm.name, SETTLED, left);
       if (settled.state === "running") return true;
-      return revive({ ...vm, state: settled.state }, round + 1);
+      return reviveOnce({ ...vm, state: settled.state }, left, round + 1);
     }
-    await waitRunning(vm.name);
+    await waitRunning(vm.name, left);
     return true;
   }
 
   async function provision(id: string): Promise<string> {
     checkTagValue(idTag, id);
     const vms = getClient().vms;
+    const left = budget(id);
     if (options.reuse !== false) {
       const candidates = (await findTagged(id))
         .filter((vm) => REVIVE[vm.state] !== undefined)
         .sort((a, b) => rank(a.state) - rank(b.state));
       for (const vm of candidates) {
-        if (await revive(vm)) return vm.name;
+        if (await revive(vm, left)) return vm.name;
       }
     }
     const { name } = await retryReservedName(() =>
@@ -317,9 +355,7 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
       }),
     );
     try {
-      const vm = await rl(() =>
-        vms.waitForState(name, ["running", "failed"], { timeoutMs: readyTimeoutMs }),
-      );
+      const vm = await waitFor(name, ["running", "failed"], left);
       if (vm.state === "failed") throw new Error(`Cove VM ${name} failed to start`);
       await ensureTags(name, tagsFor(id));
     } catch (err) {

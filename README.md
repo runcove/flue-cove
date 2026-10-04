@@ -129,7 +129,7 @@ built by the root package's `prepare` script, so reinstall the example
 `coveVms(options)`: `client` (default `fromEnv()`), `image`, `cpus`,
 `memoryMb`, `diskSizeGb`, `team`, `tags`, `idTag` (default `flue-id`),
 `expiry: { maxLifetimeSecs }`, `initialSecrets`, `reuse` (default `true`),
-`readyTimeoutMs`, `deleteTimeoutMs`, `tagGraceMs`, and the options shared with `cove()`:
+`readyTimeoutMs` (overall budget for a VM to become ready), `deleteTimeoutMs`, `tagGraceMs`, and the options shared with `cove()`:
 
 - `cwd`: the sandbox's working directory, created with `mkdir -p` (default `/workspace`);
 - `onOutput(chunk, stream)`: called with each output chunk as Cove streams it;

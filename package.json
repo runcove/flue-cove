@@ -1,8 +1,47 @@
 {
   "name": "flue-cove",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "description": "Flue sandbox adapter backed by Cove microVMs",
   "type": "module",
-  "engines": { "node": ">=22.19.0" }
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "vendor"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "node --test --test-reporter=spec --test-timeout=60000 \"test/*.test.ts\"",
+    "test:integration": "node --test --test-reporter=spec --test-concurrency=1 \"test/integration/*.test.ts\"",
+    "check:vendor": "node scripts/check-vendor.mjs",
+    "prepare": "npm run build"
+  },
+  "peerDependencies": {
+    "@flue/runtime": "^2.2.2"
+  },
+  "dependencies": {
+    "@cove/sdk": "file:vendor/cove-sdk-0.4.0.tgz"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.14",
+    "@flue/runtime": "2.2.2",
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3"
+  },
+  "bundleDependencies": [
+    "@cove/sdk"
+  ]
 }

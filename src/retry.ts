@@ -6,10 +6,12 @@
  * so the wait is a short exponential backoff with jitter.
  */
 import { CoveAPIError } from "@cove/sdk";
-import { CoveFileError } from "./files.ts";
+import { fileErrorStatus } from "./files.ts";
 
 export function isRateLimited(err: unknown): boolean {
-  return (err instanceof CoveAPIError || err instanceof CoveFileError) && err.status === 429;
+  return (
+    (err instanceof CoveAPIError && err.status === 429) || fileErrorStatus(err)?.status === 429
+  );
 }
 
 /**
@@ -19,7 +21,7 @@ export function isRateLimited(err: unknown): boolean {
  * atomically, so repeating one is safe.
  */
 export function isTransientFileError(err: unknown): boolean {
-  return isRateLimited(err) || (err instanceof CoveFileError && err.status === 503);
+  return isRateLimited(err) || fileErrorStatus(err)?.status === 503;
 }
 
 export interface RetryOptions {

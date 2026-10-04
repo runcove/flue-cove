@@ -241,9 +241,13 @@ COVE_API_URL=https://<cove-host> COVE_API_KEY_FILE=~/.cove/api_key npm run test:
 ```
 
 `src/files.ts` is a stop-gap: `@cove/sdk` 0.4.0 has no file-transfer methods,
-so it carries a small fetch client for `HEAD`/`GET`/`PUT /api/vms/{name}/files`
-behind the `CoveFiles` interface. When the SDK ships them, that file becomes a
-thin wrapper and nothing else changes.
+so it carries a small fetch client for `HEAD`/`GET`/`PUT /api/vms/{name}/files`.
+Its `CoveFiles` interface (`stat`, `download`, `downloadBytes`, `upload`) and
+its error classes (`FileTooLargeError`, `FilePathDeniedError`,
+`VmFileNotFoundError`, `FileNotRegularError`, `UnavailableError`,
+`DownloadTruncatedError`) mirror the `client.vms.files` API the SDK is adding,
+and the driver classifies errors only through `fileErrorStatus`. When the SDK
+ships them, that one file becomes a thin wrapper and nothing else changes.
 
 ## License
 

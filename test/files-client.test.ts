@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { CoveFileError, createFetchFiles } from "../src/files.ts";
+import {
+  CoveFileError,
+  createFetchFiles,
+  DownloadTruncatedError,
+  FileNotRegularError,
+  FilePathDeniedError,
+  FileTooLargeError,
+  fileErrorStatus,
+  UnavailableError,
+  VmFileNotFoundError,
+} from "../src/files.ts";
 
 const KEY = "cvk_unit_test_secret_value";
 
@@ -35,6 +45,16 @@ function files(respond: (req: Seen) => Response | Promise<Response>) {
     ...m,
     client: createFetchFiles({ baseUrl: "http://127.0.0.1:8091/", token: KEY, fetch: m.fetchImpl }),
   };
+}
+
+async function readAll(body: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = body.getReader();
+  const parts: number[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return new Uint8Array(parts);
+    parts.push(...value);
+  }
 }
 
 const jsonError = (status: number, code: string, message = `${code} happened`) =>
@@ -85,12 +105,28 @@ describe("createFetchFiles: requests", () => {
     assert.equal(seen[0]?.url.pathname, "/api/vms/we%2Fird/files");
   });
 
-  it("downloads the bytes exactly", async () => {
+  it("downloads the bytes exactly, asking for no content encoding", async () => {
     const bytes = new Uint8Array([0, 1, 2, 255, 254, 10, 13]);
-    const { client } = files(
+    const { client, seen } = files(
       () => new Response(bytes, { status: 200, headers: { "content-length": "7" } }),
     );
-    assert.deepEqual(await client.download("vm", "/bin.dat"), bytes);
+    assert.deepEqual(await client.downloadBytes("vm", "/bin.dat"), bytes);
+    assert.equal(seen[0]?.headers.get("accept-encoding"), "identity");
+  });
+
+  it("download() streams: size and mode up front, then the body", async () => {
+    const bytes = new Uint8Array([9, 8, 7]);
+    const { client } = files(
+      () =>
+        new Response(bytes, {
+          status: 200,
+          headers: { "content-length": "3", "x-cove-file-mode": "0600" },
+        }),
+    );
+    const dl = await client.download("vm", "/f");
+    assert.equal(dl.size, 3);
+    assert.equal(dl.mode, 0o600);
+    assert.deepEqual(await readAll(dl.body), bytes);
   });
 
   it("uploads raw bytes with PUT, octet-stream and the optional mode", async () => {
@@ -118,6 +154,12 @@ describe("createFetchFiles: requests", () => {
     assert.equal(seen[0]?.url.searchParams.has("mode"), false);
   });
 
+  it("refuses a size that does not match the data", async () => {
+    const { client, seen } = files(() => new Response(null));
+    await assert.rejects(client.upload("vm", "/x", new Uint8Array(3), { size: 4 }), RangeError);
+    assert.equal(seen.length, 0);
+  });
+
   it("refuses an out-of-range mode before sending anything", async () => {
     const { client, seen } = files(() => new Response(null));
     await assert.rejects(client.upload("vm", "/x", new Uint8Array(), { mode: 0o1777 }), RangeError);
@@ -140,13 +182,49 @@ describe("createFetchFiles: statuses", () => {
   ] as const) {
     it(`GET ${status} ${code} → CoveFileError with that code`, async () => {
       const { client } = files(() => jsonError(status, code));
-      await rejectsWith(client.download("vm", "/f"), status, code);
+      await rejectsWith(client.downloadBytes("vm", "/f"), status, code);
     });
     it(`PUT ${status} ${code} → CoveFileError with that code`, async () => {
       const { client } = files(() => jsonError(status, code));
       await rejectsWith(client.upload("vm", "/f", new Uint8Array([1])), status, code);
     });
   }
+
+  for (const [status, code, cls] of [
+    [413, "file_too_large", FileTooLargeError],
+    [403, "file_path_denied", FilePathDeniedError],
+    [404, "file_not_found", VmFileNotFoundError],
+    [422, "file_not_regular", FileNotRegularError],
+    [503, "unavailable", UnavailableError],
+  ] as const) {
+    it(`${status} ${code} is a ${cls.name}`, async () => {
+      const { client } = files(() => jsonError(status, code));
+      await assert.rejects(client.downloadBytes("vm", "/f"), cls);
+    });
+  }
+
+  it("404 vm_not_found is not a VmFileNotFoundError", async () => {
+    const { client } = files(() => jsonError(404, "vm_not_found"));
+    await assert.rejects(client.downloadBytes("vm", "/f"), (err: unknown) => {
+      assert.ok(!(err instanceof VmFileNotFoundError));
+      assert.deepEqual(fileErrorStatus(err), { status: 404, code: "vm_not_found" });
+      return true;
+    });
+  });
+
+  it("a HEAD 404 cannot say whether the file or the VM is missing: no code, no subclass", async () => {
+    const { client } = files(() => new Response(null, { status: 404 }));
+    await assert.rejects(client.stat("vm", "/f"), (err: unknown) => {
+      assert.ok(!(err instanceof VmFileNotFoundError));
+      assert.deepEqual(fileErrorStatus(err), { status: 404, code: undefined });
+      return true;
+    });
+  });
+
+  it("fileErrorStatus ignores errors without an HTTP status", () => {
+    assert.equal(fileErrorStatus(new Error("x")), undefined);
+    assert.equal(fileErrorStatus("x"), undefined);
+  });
 
   it("HEAD errors carry a status but no code (HEAD has no body)", async () => {
     const { client } = files(() => new Response(null, { status: 422 }));
@@ -155,12 +233,12 @@ describe("createFetchFiles: statuses", () => {
 
   it("an error body that is not JSON still yields a status", async () => {
     const { client } = files(() => new Response("bad gateway", { status: 502 }));
-    await rejectsWith(client.download("vm", "/f"), 502, undefined);
+    await rejectsWith(client.downloadBytes("vm", "/f"), 502, undefined);
   });
 
   it("401 is reported without the credential", async () => {
     const { client } = files(() => jsonError(401, "credential_invalid"));
-    await rejectsWith(client.download("vm", "/f"), 401, "credential_invalid");
+    await rejectsWith(client.downloadBytes("vm", "/f"), 401, "credential_invalid");
   });
 });
 
@@ -176,9 +254,8 @@ describe("createFetchFiles: short bodies", () => {
       });
       return new Response(body, { status: 200, headers: { "content-length": "10" } });
     });
-    await assert.rejects(client.download("vm", "/f"), (err: unknown) => {
-      assert.ok(err instanceof CoveFileError);
-      assert.equal(err.code, "short_body");
+    await assert.rejects(client.downloadBytes("vm", "/f"), (err: unknown) => {
+      assert.ok(err instanceof DownloadTruncatedError);
       assert.match(err.message, /3 of 10 bytes/);
       return true;
     });
@@ -194,7 +271,23 @@ describe("createFetchFiles: short bodies", () => {
       });
       return new Response(body, { status: 200, headers: { "content-length": "5" } });
     });
-    await assert.rejects(client.download("vm", "/f"), CoveFileError);
+    await assert.rejects(client.downloadBytes("vm", "/f"), DownloadTruncatedError);
+  });
+});
+
+describe("createFetchFiles: streamed download truncation", () => {
+  it("the streamed body errors with DownloadTruncatedError when short", async () => {
+    const { client } = files(() => {
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(new Uint8Array([1, 2]));
+          c.close();
+        },
+      });
+      return new Response(body, { status: 200, headers: { "content-length": "4" } });
+    });
+    const dl = await client.download("vm", "/f");
+    await assert.rejects(readAll(dl.body), DownloadTruncatedError);
   });
 });
 

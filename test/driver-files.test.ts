@@ -19,7 +19,13 @@ import {
   sandboxFromDriver,
 } from "@flue/runtime";
 import { CoveSandboxDriver } from "../src/driver.ts";
-import { CoveFileError, type CoveFiles } from "../src/files.ts";
+import {
+  CoveFileError,
+  type CoveFiles,
+  DownloadTruncatedError,
+  FileNotRegularError,
+  VmFileNotFoundError,
+} from "../src/files.ts";
 import { localShellClient } from "./helpers.ts";
 
 const root = mkdtempSync(join(tmpdir(), "flue-cove-files-"));
@@ -43,13 +49,13 @@ function fsFiles(override: Partial<Record<"stat" | "download" | "upload", CoveFi
         st = lstatSync(cur);
       } catch {
         if (forWrite && i === parts.length - 1) return;
-        throw new CoveFileError(404, "file_not_found", `file not found: ${cur}`);
+        throw new VmFileNotFoundError(404, "file_not_found", `file not found: ${cur}`);
       }
       if (st.isSymbolicLink()) {
-        throw new CoveFileError(422, "file_not_regular", `${cur} is a symbolic link`);
+        throw new FileNotRegularError(422, "file_not_regular", `${cur} is a symbolic link`);
       }
       if (i === parts.length - 1 && !st.isFile()) {
-        throw new CoveFileError(422, "file_not_regular", `${cur} is not a regular file`);
+        throw new FileNotRegularError(422, "file_not_regular", `${cur} is not a regular file`);
       }
     }
   };
@@ -61,11 +67,15 @@ function fsFiles(override: Partial<Record<"stat" | "download" | "upload", CoveFi
       const st = statSync(path);
       return { size: st.size, mode: st.mode & 0o777 };
     },
-    async download(_vm, path) {
+    async downloadBytes(_vm, path) {
       used.push(`download ${path}`);
       if (override.download) throw override.download;
       check(path, false);
       return new Uint8Array(readFileSync(path));
+    },
+    async download(vm, path) {
+      const bytes = await files.downloadBytes(vm, path);
+      return { size: bytes.length, body: new Blob([new Uint8Array(bytes)]).stream() };
     },
     async upload(_vm, path, bytes) {
       used.push(`upload ${path}`);
@@ -152,7 +162,7 @@ describe("readFile / readFileBuffer", () => {
 
   it("a short body is a failed read, never partial content", async () => {
     const { driver, calls } = setup({
-      download: new CoveFileError(200, "short_body", "received 3 of 10 bytes"),
+      download: new DownloadTruncatedError(200, undefined, "received 3 of 10 bytes"),
     });
     writeFileSync(join(dir, "f"), "0123456789");
     await assert.rejects(driver.readFile(join(dir, "f")), /3 of 10 bytes/);
@@ -366,6 +376,9 @@ describe("exists", () => {
             throw boom;
           },
           download: async () => {
+            throw boom;
+          },
+          downloadBytes: async () => {
             throw boom;
           },
           upload: async () => {

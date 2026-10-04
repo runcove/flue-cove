@@ -94,7 +94,8 @@ describe("rate limiting (429)", () => {
         n++;
         throw new CoveFileError(503, "unavailable", "guest agent timed out");
       },
-      download: async () => new Uint8Array(),
+      download: async () => ({ size: 0, body: new Blob([]).stream() }),
+      downloadBytes: async () => new Uint8Array(),
     };
     const { client } = scriptedClient(() => []);
     const driver = new CoveSandboxDriver(client, "vm", { files });
@@ -107,7 +108,8 @@ describe("rate limiting (429)", () => {
     const files: CoveFiles = {
       stat: async () => ({ size: 0 }),
       upload: async (_vm, path) => ({ path, size: 0, mode: 0o644, sha256: "" }),
-      download: async () => {
+      download: async () => ({ size: 0, body: new Blob([]).stream() }),
+      downloadBytes: async () => {
         if (++n < 2) throw new CoveFileError(429, undefined, "slow down");
         return new TextEncoder().encode("data");
       },

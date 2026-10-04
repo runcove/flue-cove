@@ -25,12 +25,21 @@ export {
   DEFAULT_ID_TAG,
 } from "./factory.ts";
 export {
+  type CoveFileDownload,
   CoveFileError,
   type CoveFileInfo,
   type CoveFiles,
   type CoveFilesCallOptions,
   type CoveFileUploaded,
+  type CoveUploadOptions,
   createFetchFiles,
+  DownloadTruncatedError,
   type FetchFilesOptions,
+  FileNotRegularError,
+  FilePathDeniedError,
+  FileTooLargeError,
+  fileErrorStatus,
+  UnavailableError,
+  VmFileNotFoundError,
 } from "./files.ts";
 export { buildScript, shellQuote, validateEnvName } from "./quote.ts";

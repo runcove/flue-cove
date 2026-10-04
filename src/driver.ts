@@ -22,7 +22,7 @@ import {
   SandboxOperationUnsupportedError,
   type ShellResult,
 } from "@flue/runtime";
-import { CoveFileError, type CoveFiles } from "./files.ts";
+import { type CoveFiles, fileErrorStatus } from "./files.ts";
 import { buildScript } from "./quote.ts";
 import {
   abortableSleep,
@@ -172,10 +172,15 @@ function vmGone(status: number, code: string | undefined): boolean {
 
 /**
  * Whether a file-API refusal is one a shell in the guest can still serve.
- * HEAD errors carry no code, so a HEAD 403/409 falls back too (the exec then
- * reports the real problem, e.g. a VM that is not running).
+ * HEAD errors carry no body, hence no code: a HEAD 403 or 409 cannot be told
+ * from its other causes, so it falls back too (the exec then reports the real
+ * problem, e.g. a VM that is not running). A HEAD 422 is any kind of
+ * "not a regular file", which is exactly what the fallback handles.
  */
-function canFallBack(err: CoveFileError, op: "stat" | "download" | "upload"): boolean {
+function canFallBack(
+  err: { status: number; code: string | undefined },
+  op: "stat" | "download" | "upload",
+): boolean {
   switch (err.status) {
     case 400: // a path the API's syntax rules refuse (e.g. "/")
     case 422: // symlink in the path, directory, special file
@@ -418,10 +423,13 @@ export class CoveSandboxDriver implements SandboxDriver {
     operation: string,
     path: string,
   ): void {
-    if (!(err instanceof CoveFileError)) throw err;
-    if (vmGone(err.status, err.code)) throw died(operation);
-    if (err.status === 404) throw fsError("ENOENT", operation, path, "no such file or directory");
-    if (!canFallBack(err, op)) throw err;
+    const http = fileErrorStatus(err);
+    if (!http) throw err;
+    if (vmGone(http.status, http.code)) throw died(operation);
+    // A HEAD 404 has no code, so it may also mean the VM is gone; reporting
+    // ENOENT then is the closest honest answer (the next exec will say more).
+    if (http.status === 404) throw fsError("ENOENT", operation, path, "no such file or directory");
+    if (!canFallBack(http, op)) throw err;
   }
 
   // ─── files ───────────────────────────────────────────────────────────────
@@ -434,7 +442,7 @@ export class CoveSandboxDriver implements SandboxDriver {
     const files = this.#files;
     if (files) {
       try {
-        return await withRateLimitRetry(() => files.download(this.#vm, path), FILE_RETRY);
+        return await withRateLimitRetry(() => files.downloadBytes(this.#vm, path), FILE_RETRY);
       } catch (err) {
         this.#fileFailure(err, "download", "readFile", path);
       }
@@ -527,7 +535,8 @@ export class CoveSandboxDriver implements SandboxDriver {
           await withRateLimitRetry(() => files.stat(this.#vm, path), FILE_RETRY);
           return true;
         } catch (err) {
-          if (err instanceof CoveFileError && err.status === 404) return false;
+          // 404 (file or, for a HEAD, possibly the VM) reads as "not there".
+          if (fileErrorStatus(err)?.status === 404) return false;
           // Anything else (directory, symlink, denied, transport): ask the shell.
         }
       }

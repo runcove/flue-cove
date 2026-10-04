@@ -16,6 +16,37 @@ import {
 import { localShellClient, scriptedClient } from "./helpers.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "flue-cove-exec-"));
+
+/** Poll until `cond()` holds, or fail after `deadlineMs`. Loaded machines get the whole budget. */
+async function eventually(what: string, cond: () => boolean, deadlineMs = 20_000): Promise<void> {
+  const end = Date.now() + deadlineMs;
+  while (!cond()) {
+    if (Date.now() > end) assert.fail(`${what} did not happen within ${deadlineMs} ms`);
+    await sleep(50);
+  }
+}
+
+/** The pid a test command wrote to `file`, once it has. */
+async function pidFrom(file: string): Promise<number> {
+  await eventually(`${file} written`, () => {
+    try {
+      return /^\d+\s*$/.test(readFileSync(file, "utf8"));
+    } catch {
+      return false;
+    }
+  });
+  return Number(readFileSync(file, "utf8").trim());
+}
+
+/** Gone, or a zombie waiting to be reaped: either way it runs nothing more. */
+function dead(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+  } catch {
+    return true;
+  }
+}
 after(() => rmSync(dir, { recursive: true, force: true }));
 
 describe("timeoutSecsFor", () => {
@@ -167,13 +198,20 @@ describe("exec: timeout", () => {
   it("kills the whole process group, not just the direct child", {
     skip: process.platform !== "linux" && "needs setsid",
   }, async () => {
-    const marker = join(dir, "timeout-marker");
+    // The background child records its pid and would sleep for a minute. The
+    // kill is proved by polling until that process is dead, with a generous
+    // deadline, not by a fixed wait racing a timer: under load the kill can
+    // land later than any short bound.
+    const pidFile = join(dir, "timeout-child.pid");
     const { client } = localShellClient();
     const driver = new CoveSandboxDriver(client, "vm");
-    const res = await driver.exec(`(sleep 2; touch '${marker}') & sleep 5`, { timeoutMs: 500 });
+    const res = await driver.exec(
+      `sh -c 'echo $$ > "$1"; exec sleep 60' sh '${pidFile}' & sleep 30`,
+      { timeoutMs: 500 },
+    );
     assert.equal(res.exitCode, 124);
-    await sleep(2500);
-    assert.equal(existsSync(marker), false, "a backgrounded child outlived the timeout");
+    const child = await pidFrom(pidFile);
+    await eventually("the backgrounded child killed with its group", () => dead(child));
   });
 
   it("does not treat an unrelated error as a timeout when no deadline was set", async () => {
@@ -186,16 +224,17 @@ describe("exec: timeout", () => {
 
 describe("exec: abort", () => {
   it("kills the guest command when the caller aborts", async () => {
-    const marker = join(dir, "abort-marker");
+    const pidFile = join(dir, "abort-child.pid");
     const { client, calls } = localShellClient();
     const driver = new CoveSandboxDriver(client, "vm");
     const ac = new AbortController();
-    const p = driver.exec(`sleep 2; touch '${marker}'`, { signal: ac.signal });
-    await sleep(300);
+    const p = driver.exec(`sh -c 'echo $$ > "$1"; exec sleep 60' sh '${pidFile}'`, {
+      signal: ac.signal,
+    });
+    const child = await pidFrom(pidFile);
     ac.abort(new Error("stop"));
     await assert.rejects(p);
-    await sleep(2500);
-    assert.equal(existsSync(marker), false, "the aborted command kept running");
+    await eventually("the aborted command killed", () => dead(child));
     // The kill went out as a second exec, without the aborted signal.
     assert.equal(calls.length, 2);
     assert.equal(calls[1]?.signal, undefined);

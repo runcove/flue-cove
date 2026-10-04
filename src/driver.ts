@@ -329,20 +329,30 @@ export class CoveSandboxDriver implements SandboxDriver {
         : Math.min(Math.max(0, options.timeoutMs), MAX_TIMER_MS);
     try {
       const out = await withRateLimitRetry(
-        () => {
-          // The deadline starts when a request goes out: a 429'd attempt ran nothing.
-          clearTimeout(timer);
+        async () => {
+          // The deadline starts when a request goes out: a 429'd attempt ran
+          // nothing, so its timer must not survive into the backoff and fire
+          // a kill that would find the retry's pid file.
+          timedOut = false;
           if (delay !== undefined) {
             timer = setTimeout(() => {
               timedOut = true;
               void this.#killGroup(pidFile);
             }, delay);
           }
-          return this.#client.vms.execWithSecrets(
-            this.#vm,
-            { command: argv, selector },
-            options.signal ? { signal: options.signal } : {},
-          );
+          try {
+            return await this.#client.vms.execWithSecrets(
+              this.#vm,
+              { command: argv, selector },
+              options.signal ? { signal: options.signal } : {},
+            );
+          } catch (err) {
+            if (isRateLimited(err)) {
+              clearTimeout(timer);
+              timedOut = false;
+            }
+            throw err;
+          }
         },
         options.signal ? { signal: options.signal } : {},
       );

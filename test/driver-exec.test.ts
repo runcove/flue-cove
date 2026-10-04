@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
-import { ConflictError, NotFoundError } from "@cove/sdk";
+import { ConflictError, NotFoundError, RateLimitError } from "@cove/sdk";
 import { SandboxDiedError, sandboxFromDriver } from "@flue/runtime";
 import {
   type CoveExecClient,
@@ -373,6 +373,26 @@ describe("the group-kill helper", { skip: !LINUX && "needs /proc and setsid" }, 
 });
 
 describe("exec: secrets timers", () => {
+  it("a deadline shorter than the 429 backoff neither reports 124 nor kills the retry", async () => {
+    const shell = localShellClient();
+    let attempts = 0;
+    const client = {
+      vms: {
+        exec: shell.client.vms.exec,
+        execWithSecrets: async (vm: string, opts: { command: string[] }) => {
+          if (++attempts === 1) throw new RateLimitError(429, "HTTP 429: Too Many Requests");
+          return shell.client.vms.execWithSecrets(vm, { ...opts, selector: { kind: "all" } });
+        },
+      },
+    } as unknown as CoveExecClient;
+    const driver = new CoveSandboxDriver(client, "vm", { secrets: { kind: "all" } });
+    // The first attempt's 200 ms timer would fire during the >= 250 ms backoff
+    // and its kill would find the retry's pid file.
+    const res = await driver.exec("sleep 0.1; echo ok", { timeoutMs: 200 });
+    assert.equal(attempts, 2);
+    assert.deepEqual(res, { stdout: "ok\n", stderr: "", exitCode: 0 });
+  });
+
   it("a timeoutMs beyond setTimeout's range does not fire at once", async () => {
     const { client } = localShellClient();
     const driver = new CoveSandboxDriver(client, "vm", { secrets: { kind: "all" } });

@@ -185,11 +185,22 @@ export function scriptedClient(
   return { client, calls };
 }
 
+/** The codes the SDK's `stat` fills in for a body-less HEAD error whose status names one. */
+const HEAD_IMPLIED_CODES: Record<number, string> = {
+  413: "file_too_large",
+  422: "file_not_regular",
+  503: "unavailable",
+};
+
 /**
  * The error `@cove/sdk` throws for an HTTP refusal, built by the SDK's own
  * mapping (`CoveAPIError.fromResponse`): `code` set means a JSON error body
- * (GET/PUT); omitted, a body-less HEAD answer, as `stat` sees it.
+ * (GET/PUT); omitted, a body-less HEAD answer, as `stat` sees it, which gets
+ * the code the SDK implies for 413, 422 and 503 and none otherwise.
  */
 export function apiError(status: number, code?: string, message = code ?? "refused"): CoveAPIError {
-  return CoveAPIError.fromResponse(status, code === undefined ? undefined : { code, message });
+  if (code === undefined) {
+    return CoveAPIError.fromResponse(status, undefined, undefined, HEAD_IMPLIED_CODES[status]);
+  }
+  return CoveAPIError.fromResponse(status, { code, message });
 }

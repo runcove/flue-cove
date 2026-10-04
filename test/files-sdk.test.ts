@@ -24,6 +24,7 @@ import {
   UnavailableError,
   VmFileNotFoundError,
 } from "../src/files.ts";
+import { apiError } from "./helpers.ts";
 
 const KEY = "cvk_unit_test_secret_value";
 
@@ -114,6 +115,17 @@ describe("filesFor / sdkFiles: the wire", () => {
     assert.deepEqual(await files.downloadBytes("vm", "/bin.dat"), bytes);
     assert.equal(seen[0]?.method, "GET");
     assert.equal(seen[0]?.headers.get("accept-encoding"), "identity");
+  });
+
+  it("only GET asks for identity: HEAD and PUT send no Accept-Encoding: identity", async () => {
+    const { files, seen } = client((req) => (req.method === "PUT" ? uploaded() : ok(null, 0)));
+    await files.stat("vm", "/f");
+    await files.upload("vm", "/f", new Uint8Array([1]));
+    assert.deepEqual(
+      seen.map((r) => r.method),
+      ["HEAD", "PUT"],
+    );
+    for (const req of seen) assert.notEqual(req.headers.get("accept-encoding"), "identity");
   });
 
   it("download() gives size and mode up front, then the body", async () => {
@@ -291,4 +303,19 @@ describe("SDK errors as the driver sees them (fileErrorStatus)", () => {
     await assert.rejects(files.upload("vm", "/f", new Uint8Array([1])), RateLimitError);
     assert.equal(seen.length, 2);
   });
+});
+
+describe("test helper apiError matches the SDK", () => {
+  for (const status of [403, 404, 409, 413, 422, 503]) {
+    it(`a body-less ${status} carries the same class and code as a live HEAD`, async () => {
+      const { files } = client(() => new Response(null, { status }));
+      const live = await files.stat("vm", "/f").then(
+        () => assert.fail("expected a refusal"),
+        (err: unknown) => err as Error,
+      );
+      const made = apiError(status);
+      assert.equal(made.constructor.name, live.constructor.name);
+      assert.deepEqual(fileErrorStatus(made), fileErrorStatus(live));
+    });
+  }
 });

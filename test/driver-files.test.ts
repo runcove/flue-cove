@@ -331,7 +331,7 @@ describe("stat", () => {
   });
 
   it("413 on HEAD (a big file) falls back to exec instead of failing", async () => {
-    const { driver } = setup({ stat: apiError(413, "file_too_large") });
+    const { driver } = setup({ stat: apiError(413) });
     writeFileSync(join(dir, "f"), "x");
     assert.equal((await driver.stat(join(dir, "f"))).size, 1);
   });

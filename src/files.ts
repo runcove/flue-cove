@@ -8,14 +8,14 @@
  * classifies failures only through {@link fileErrorStatus}, which reads the
  * SDK errors' HTTP `status` and API `code`, never their message text.
  */
-import {
-  CoveAPIError,
-  type CoveClient,
-  type FileUploaded,
-  type VmFileDownload,
-  type VmFileStat,
-  type VmFilesResource,
+import type {
+  CoveClient,
+  FileUploaded,
+  VmFileDownload,
+  VmFileStat,
+  VmFilesResource,
 } from "@cove/sdk";
+import { apiErrorStatus } from "./errors.ts";
 
 export {
   DownloadTruncatedError,
@@ -107,7 +107,9 @@ export function filesFor(client: Pick<CoveClient, "vms"> | object): CoveFiles | 
  * (`CoveConnectionError`), an abort, a `DownloadTruncatedError` (the server
  * had already answered 200), or the SDK refusing a request before sending it.
  *
- * Every HTTP refusal is a `CoveAPIError`: the file classes
+ * Errors are recognised by shape (see `errors.ts`), not `instanceof`, so a
+ * client built from another copy of the SDK classifies the same. Every HTTP
+ * refusal is a `CoveAPIError`: the file classes
  * (`FilePathDeniedError`, `VmFileNotFoundError`, `FileNotRegularError`,
  * `FileTooLargeError`, `UnavailableError`) and the plain status classes for
  * the rest, such as a key without `files:read`/`files:write`, which is a
@@ -121,6 +123,5 @@ export function filesFor(client: Pick<CoveClient, "vms"> | object): CoveFiles | 
 export function fileErrorStatus(
   err: unknown,
 ): { status: number; code: string | undefined } | undefined {
-  if (err instanceof CoveAPIError) return { status: err.status, code: err.code };
-  return undefined;
+  return apiErrorStatus(err);
 }

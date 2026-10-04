@@ -13,6 +13,9 @@ conversation, reached over the Cove API with the Cove TypeScript SDK
   It never creates or deletes anything.
 - `CoveSandboxDriver` implements Flue's `SandboxDriver`, for custom wiring.
 - `fromEnv()` builds a `CoveClient` from environment variables.
+- `CoveClient` is re-exported from the bundled `@cove/sdk`. A client built
+  from another copy of the SDK works too: the adapter recognises its errors
+  by their HTTP `status` and API `code`, not by class.
 
 It implements Flue's [Sandbox Adapter API](https://flueframework.com/docs/reference/sandbox-api/)
 (`@flue/runtime` 2.2.x) and imports only public `@flue/runtime` exports.

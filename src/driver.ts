@@ -14,7 +14,7 @@
  * so spaces, quotes, newlines and leading dashes all survive.
  */
 import { randomUUID } from "node:crypto";
-import { CoveAPIError, type CoveClient, type ExecEvent, type InjectSelector } from "@cove/sdk";
+import type { CoveClient, ExecEvent, InjectSelector } from "@cove/sdk";
 import {
   type FileStat,
   SandboxDiedError,
@@ -22,6 +22,7 @@ import {
   SandboxOperationUnsupportedError,
   type ShellResult,
 } from "@flue/runtime";
+import { apiErrorStatus } from "./errors.ts";
 import { type CoveFiles, fileErrorStatus } from "./files.ts";
 import { buildScript } from "./quote.ts";
 import {
@@ -384,7 +385,8 @@ export class CoveSandboxDriver implements SandboxDriver {
       void this.#killGroup(pidFile);
       return err;
     }
-    if (err instanceof CoveAPIError && vmGone(err.status, err.code)) return died("exec");
+    const http = apiErrorStatus(err);
+    if (http && vmGone(http.status, http.code)) return died("exec");
     return err;
   }
 
@@ -441,7 +443,8 @@ export class CoveSandboxDriver implements SandboxDriver {
         else throw new Error(`Cove exec on ${this.#vm} failed during ${operation}: ${ev.error}`);
       }
     } catch (err) {
-      if (err instanceof CoveAPIError && vmGone(err.status, err.code)) throw died(operation);
+      const http = apiErrorStatus(err);
+      if (http && vmGone(http.status, http.code)) throw died(operation);
       throw err;
     }
     throw new Error(`Cove exec on ${this.#vm} ended without an exit status during ${operation}`);

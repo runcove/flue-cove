@@ -109,3 +109,10 @@ describe("createCoveClient", () => {
     noKey(files);
   });
 });
+
+describe("package exports", () => {
+  it("re-exports the bundled SDK's CoveClient, so apps can build from the same copy", async () => {
+    const index = await import("../src/index.ts");
+    assert.equal(index.CoveClient, CoveClient);
+  });
+});

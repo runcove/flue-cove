@@ -6,11 +6,11 @@
  * (its file methods included) nor exposes `Retry-After`, so the retry lives
  * here and the wait is a short exponential backoff with jitter (runcove-413g9).
  */
-import { CoveAPIError } from "@cove/sdk";
-import { fileErrorStatus } from "./files.ts";
+import { apiErrorStatus } from "./errors.ts";
 
+/** A 429 from any copy of the SDK (recognised by shape, see `errors.ts`). */
 export function isRateLimited(err: unknown): boolean {
-  return err instanceof CoveAPIError && err.status === 429;
+  return apiErrorStatus(err)?.status === 429;
 }
 
 /**
@@ -20,7 +20,7 @@ export function isRateLimited(err: unknown): boolean {
  * atomically, so repeating one is safe.
  */
 export function isTransientFileError(err: unknown): boolean {
-  return isRateLimited(err) || fileErrorStatus(err)?.status === 503;
+  return isRateLimited(err) || apiErrorStatus(err)?.status === 503;
 }
 
 export interface RetryOptions {

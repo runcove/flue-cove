@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
+  ConflictError,
   CoveAPIError,
+  CoveConnectionError,
   type CreateVmRequest,
   type ExecEvent,
   NotFoundError,
+  PermissionDeniedError,
   RateLimitError,
   type VmState,
   type VmSummary,
@@ -24,7 +27,17 @@ interface FakeVm {
  * a tick), delete is async (deleting → gone), exec always exits 0 and is
  * recorded. `createOutcome` can make creates fail.
  */
-function fakeCove(opts: { createOutcome?: "running" | "failed"; createDelayMs?: number } = {}) {
+function fakeCove(
+  opts: {
+    createOutcome?: "running" | "failed";
+    createDelayMs?: number;
+    /** Like the server: initial tags land only after the VM is created. `false` drops them. */
+    applyTags?: boolean;
+    /** The create was accepted, but the response never arrived. */
+    createTransportError?: boolean;
+    tagSetFails?: boolean;
+  } = {},
+) {
   const vms = new Map<string, FakeVm>();
   const log: string[] = [];
   const creates: CreateVmRequest[] = [];
@@ -56,11 +69,16 @@ function fakeCove(opts: { createOutcome?: "running" | "failed"; createDelayMs?: 
         creates.push(req);
         const name = req.name ?? `vm-${++seq}`;
         log.push(`create ${name}`);
-        vms.set(name, { name, state: "creating", tags: { ...(req.initial_tags ?? {}) } });
+        vms.set(name, { name, state: "creating", tags: {} });
         setTimeout(() => {
           const vm = vms.get(name);
-          if (vm) vm.state = opts.createOutcome ?? "running";
+          if (!vm) return;
+          vm.state = opts.createOutcome ?? "running";
+          if (vm.state === "running" && opts.applyTags !== false) {
+            Object.assign(vm.tags, req.initial_tags ?? {});
+          }
         }, opts.createDelayMs ?? 5);
+        if (opts.createTransportError) throw new CoveConnectionError("socket hang up");
         return { name };
       },
       get,
@@ -99,6 +117,15 @@ function fakeCove(opts: { createOutcome?: "running" | "failed"; createDelayMs?: 
       },
       async execWithSecrets() {
         return { exit_code: 0, stdout: "", stderr: "" };
+      },
+    },
+    tags: {
+      async set(name, key, value) {
+        log.push(`tag ${name} ${key}=${value}`);
+        if (opts.tagSetFails) throw new PermissionDeniedError(403, "no tags:write", "scope_denied");
+        const vm = vms.get(name);
+        if (!vm) throw new NotFoundError(404, "gone", "vm_not_found");
+        vm.tags[key] = value;
       },
     },
   };
@@ -243,6 +270,59 @@ describe("coveVms: id dedupe and reuse", () => {
     await factory.createSandbox({ id: "r" });
     await factory.createSandbox({ id: "r" });
     assert.equal(fake.creates.length, 2);
+  });
+});
+
+describe("coveVms: tags and races", () => {
+  it("sets any initial tag the server has not applied once the VM is running", async () => {
+    const fake = fakeCove({ applyTags: false });
+    const factory = coveVms({ client: fake.client, files: noFiles, tags: { app: "x" } });
+    await factory.createSandbox({ id: "t" });
+    assert.deepEqual(fake.vms.get("vm-1")?.tags, { "flue-id": "t", app: "x" });
+    assert.ok(fake.log.includes("tag vm-1 flue-id=t"));
+  });
+
+  it("does not re-set tags the server already applied", async () => {
+    const fake = fakeCove();
+    await coveVms({ client: fake.client, files: noFiles }).createSandbox({ id: "t" });
+    assert.deepEqual(
+      fake.log.filter((l) => l.startsWith("tag ")),
+      [],
+    );
+  });
+
+  it("deletes the VM and throws when the tags cannot be set", async () => {
+    const fake = fakeCove({ applyTags: false, tagSetFails: true });
+    await assert.rejects(
+      coveVms({ client: fake.client, files: noFiles }).createSandbox({ id: "t" }),
+      /tag/,
+    );
+    assert.equal(fake.vms.size, 0);
+  });
+
+  it("a concurrent reviver's 409 from start/resume/wake is tolerated", async () => {
+    const fake = fakeCove();
+    fake.vms.set("old", { name: "old", state: "stopped", tags: { "flue-id": "z" } });
+    fake.client.vms.start = async (name) => {
+      const vm = fake.vms.get(name);
+      if (vm) setTimeout(() => (vm.state = "running"), 5);
+      throw new ConflictError(
+        409,
+        "invalid state transition: starting -> running",
+        "invalid_state_transition",
+      );
+    };
+    await coveVms({ client: fake.client, files: noFiles }).createSandbox({ id: "z" });
+    assert.equal(fake.creates.length, 0);
+  });
+
+  it("releaseAll also deletes a VM whose create response was lost", async () => {
+    const fake = fakeCove({ createTransportError: true });
+    const factory = coveVms({ client: fake.client, files: noFiles });
+    await assert.rejects(factory.createSandbox({ id: "lost" }), /socket hang up/);
+    await sleep(20); // the server finished creating and tagged it
+    await factory.releaseAll();
+    assert.equal(fake.vms.size, 0);
   });
 });
 

@@ -8,6 +8,7 @@
  *   Flue itself never tears a sandbox down; cleanup is the application's job.
  */
 import {
+  ConflictError,
   CoveAPIError,
   type CoveClient,
   type CoveClientOptions,
@@ -37,6 +38,7 @@ export interface CoveProvisioningClient {
     | "exec"
     | "execWithSecrets"
   >;
+  tags: Pick<CoveClient["tags"], "set">;
 }
 
 export const DEFAULT_CWD = "/workspace";
@@ -142,9 +144,9 @@ export interface CoveVmsFactory extends SandboxFactory {
 
 /** States a reusable VM can be brought back to `running` from. */
 const REVIVE: Partial<Record<VmState, "start" | "resume" | "wake" | "wait">> = {
+  // No `creating`/`pooled`: Cove applies initial tags only once a create has
+  // succeeded, so a VM found by its tags is never still creating.
   running: "wait",
-  creating: "wait",
-  pooled: "wait",
   resuming: "wait",
   waking: "wait",
   pausing: "wait",
@@ -162,7 +164,7 @@ const PREFERENCE: VmState[] = [
   "running",
   "resuming",
   "waking",
-  "creating",
+
   "paused",
   "hibernated",
   "stopped",
@@ -210,6 +212,7 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
 
   const rl = <T>(fn: () => Promise<T>): Promise<T> => withRateLimitRetry(fn);
   const inflight = new Map<string, Promise<string>>();
+  const started = new Set<string>();
   const resolved = new Map<string, string>();
 
   const tagsFor = (id: string): Record<string, string> => ({ [idTag]: id, ...extraTags });
@@ -255,9 +258,15 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
       if (settled.state === "running") return true;
       return revive({ ...vm, state: settled.state });
     }
-    if (how === "start") await rl(() => vms.start(vm.name));
-    else if (how === "resume") await rl(() => vms.resume(vm.name));
-    else await rl(() => vms.wake(vm.name));
+    try {
+      if (how === "start") await rl(() => vms.start(vm.name));
+      else if (how === "resume") await rl(() => vms.resume(vm.name));
+      else await rl(() => vms.wake(vm.name));
+    } catch (err) {
+      // Another process got there first and the VM is already on its way to
+      // running: wait for it like they do.
+      if (!(err instanceof ConflictError && err.code === "invalid_state_transition")) throw err;
+    }
     await waitRunning(vm.name);
     return true;
   }
@@ -292,6 +301,7 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
         vms.waitForState(name, ["running", "failed"], { timeoutMs: readyTimeoutMs }),
       );
       if (vm.state === "failed") throw new Error(`Cove VM ${name} failed to start`);
+      await ensureTags(name, tagsFor(id));
     } catch (err) {
       // We created it; don't leave a broken VM behind.
       await deleteAndWait(name).catch(() => undefined);
@@ -300,9 +310,32 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
     return name;
   }
 
+  /**
+   * Cove applies `initial_tags` after the create succeeds, best effort: a
+   * tag that fails is only logged server-side. Without its tags a VM is
+   * invisible to reuse and to `release` from another process, so check them
+   * and set any that are missing (needs `tags:write`).
+   */
+  async function ensureTags(name: string, wanted: Record<string, string>): Promise<void> {
+    const c = getClient();
+    const have = (await rl(() => c.vms.get(name))).tags ?? {};
+    for (const [key, value] of Object.entries(wanted)) {
+      if (have[key] === value) continue;
+      try {
+        await rl(() => c.tags.set(name, key, value));
+      } catch (err) {
+        const why = err instanceof Error ? err.message : String(err);
+        throw new Error(`Cove VM ${name} is missing its ${key} tag and setting it failed: ${why}`);
+      }
+    }
+  }
+
   async function ensure(id: string): Promise<string> {
     let pending = inflight.get(id);
     if (!pending) {
+      // Remember the id even if provisioning fails: a create the server
+      // accepted but whose answer was lost still leaves a VM to release.
+      started.add(id);
       pending = provision(id).then((name) => {
         resolved.set(id, name);
         return name;
@@ -349,6 +382,7 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
     if (known) names.add(known);
     await Promise.all([...names].map(deleteAndWait));
     resolved.delete(id);
+    started.delete(id);
   }
 
   return {
@@ -360,7 +394,7 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
     },
     release,
     async releaseAll(): Promise<void> {
-      const ids = new Set([...resolved.keys(), ...inflight.keys()]);
+      const ids = new Set([...resolved.keys(), ...inflight.keys(), ...started]);
       const results = await Promise.allSettled([...ids].map(release));
       const failed = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
       if (failed.length > 0) {

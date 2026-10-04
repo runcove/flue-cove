@@ -267,6 +267,11 @@ These were measured against a Cove server built after 0.33.2 that includes the f
 - **Size cap.** The file API refuses files above the server's `[files]
   max_bytes` (100 MiB by default) with 413. Reads and writes of such a file
   fail; there is no exec fallback for content (`stat`/`exists` still work).
+- **Timeouts on transfers.** A client's `timeoutMs` does not cut file
+  transfers short. Each upload gets its own deadline from its size: twice
+  the time the server allows at its 256 KiB/s floor, plus a minute, and
+  never under three minutes. For downloads, the SDK applies `timeoutMs` to
+  the response headers only.
 - **File-API writes** create files owned by root, keep an existing file's mode
   and use `0644` for a new one.
 - **Rate limit.** Cove limits each source address (30 requests/s by default).

@@ -793,3 +793,72 @@ describe("a 200 the SDK cannot trust (no Content-Length, or a content encoding)"
     assert.equal(calls.length, 0);
   });
 });
+
+describe("a client-wide timeoutMs and file transfers", () => {
+  /** A real CoveClient with a short timeoutMs; its fetch takes `delayMs`, honouring the signal. */
+  function slowClient(delayMs: number, respond: (method: string) => Response) {
+    const seen: Array<{ method: string }> = [];
+    const client = new CoveClient({
+      baseUrl: "http://127.0.0.1:8091",
+      token: "cvk_unit",
+      timeoutMs: 50,
+      fetch: (async (_u: unknown, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        seen.push({ method });
+        await new Promise<void>((resolve, reject) => {
+          const t = setTimeout(resolve, delayMs);
+          init?.signal?.addEventListener("abort", () => {
+            clearTimeout(t);
+            reject(init.signal?.reason);
+          });
+        });
+        return respond(method);
+      }) as typeof fetch,
+    });
+    return { client, seen };
+  }
+
+  it("an upload is not cut off by the client's short timeoutMs", async () => {
+    const { client, seen } = slowClient(
+      200,
+      () =>
+        new Response(JSON.stringify({ path: "/f", size: 1, mode: 420, sha256: "" }), {
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    const shell = localShellClient();
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: filesFor(client) });
+    await driver.writeFile(join(dir, "f"), "x");
+    assert.deepEqual(seen, [{ method: "PUT" }]);
+    assert.equal(shell.calls.length, 0, "no exec fallback");
+  });
+
+  it("the upload budget grows with the size and never drops below two minutes", async () => {
+    const { uploadTimeoutMs } = await import("../src/driver.ts");
+    assert.ok(uploadTimeoutMs(0) >= 120_000);
+    assert.ok(uploadTimeoutMs(1024 ** 3) > uploadTimeoutMs(1024 ** 2));
+    // At the server's floor of 256 KiB/s, 1 GiB takes 4096 s; the budget allows more.
+    assert.ok(uploadTimeoutMs(1024 ** 3) > 4096_000);
+  });
+
+  it("a download's body is not bound by timeoutMs, only its headers (SDK behaviour)", async () => {
+    const client = new CoveClient({
+      baseUrl: "http://127.0.0.1:8091",
+      token: "cvk_unit",
+      timeoutMs: 50,
+      fetch: (async () => {
+        const body = new ReadableStream<Uint8Array>({
+          async start(c) {
+            await new Promise((r) => setTimeout(r, 200));
+            c.enqueue(new Uint8Array([104, 105]));
+            c.close();
+          },
+        });
+        return new Response(body, { status: 200, headers: { "content-length": "2" } });
+      }) as typeof fetch,
+    });
+    const shell = localShellClient();
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: filesFor(client) });
+    assert.equal(await driver.readFile("/f"), "hi");
+  });
+});

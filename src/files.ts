@@ -37,6 +37,12 @@ export type CoveFileUploaded = FileUploaded;
 
 export interface CoveFilesCallOptions {
   signal?: AbortSignal;
+  /**
+   * This call's deadline in milliseconds, in place of the client's
+   * `timeoutMs`. For a download it bounds the wait for the headers only (the
+   * body streams for as long as it takes); for an upload, the whole request.
+   */
+  timeoutMs?: number;
 }
 
 export interface CoveUploadOptions extends CoveFilesCallOptions {
@@ -65,8 +71,12 @@ export type CoveFilesResource = Pick<
   "stat" | "download" | "downloadBytes" | "upload"
 >;
 
-const overrides = (opts: CoveFilesCallOptions | undefined) =>
-  opts?.signal ? { signal: opts.signal } : {};
+const overrides = (opts: CoveFilesCallOptions | undefined) => {
+  const out: { signal?: AbortSignal; timeoutMs?: number } = {};
+  if (opts?.signal) out.signal = opts.signal;
+  if (opts?.timeoutMs !== undefined) out.timeoutMs = opts.timeoutMs;
+  return out;
+};
 
 /**
  * {@link CoveFiles} over the SDK's `client.vms.files`. The resource is held in

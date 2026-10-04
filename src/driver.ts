@@ -83,6 +83,19 @@ export function timeoutSecsFor(timeoutMs: number | undefined): number | undefine
   return Math.max(1, Math.ceil(timeoutMs / 1000));
 }
 
+/**
+ * The deadline for one upload, in place of the client's `timeoutMs`, which
+ * would otherwise bound the whole transfer: a client built with a short
+ * deadline for its API calls would cut large writes off. The server ends a
+ * transfer that averages under 256 KiB/s (60 s at the least), so allow twice
+ * that, plus a minute. Downloads need nothing: the SDK bounds only their
+ * headers by `timeoutMs`.
+ */
+export function uploadTimeoutMs(bytes: number): number {
+  const serverBoundMs = Math.max(60_000, Math.ceil((bytes / (256 * 1024)) * 1000));
+  return 60_000 + 2 * serverBoundMs;
+}
+
 /** Largest raw chunk per exec on the write fallback: its base64 stays well under MAX_ARG_STRLEN (128 KiB). */
 const WRITE_CHUNK_BYTES = 64 * 1024;
 
@@ -585,7 +598,11 @@ export class CoveSandboxDriver implements SandboxDriver {
     const files = this.#filesFor("write");
     if (files) {
       try {
-        await withRateLimitRetry(() => files.upload(this.#vm, path, bytes), FILE_RETRY);
+        const timeoutMs = uploadTimeoutMs(bytes.byteLength);
+        await withRateLimitRetry(
+          () => files.upload(this.#vm, path, bytes, { timeoutMs }),
+          FILE_RETRY,
+        );
         this.#routeSeen();
         return;
       } catch (err) {

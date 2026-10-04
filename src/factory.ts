@@ -7,20 +7,12 @@
  *   Flue instance id and deletes it when the application calls `release`.
  *   Flue itself never tears a sandbox down; cleanup is the application's job.
  */
-import {
-  ConflictError,
-  CoveAPIError,
-  type CoveClient,
-  type CoveClientOptions,
-  NotFoundError,
-  type SecretSpec,
-  type VmState,
-  type VmSummary,
-} from "@cove/sdk";
+import type { CoveClient, CoveClientOptions, SecretSpec, VmState, VmSummary } from "@cove/sdk";
 import { type Sandbox, type SandboxFactory, sandboxFromDriver } from "@flue/runtime";
-import { createCoveClient, filesFor, fromEnv } from "./client.ts";
+import { createCoveClient, fromEnv } from "./client.ts";
 import { type CoveDriverOptions, type CoveExecClient, CoveSandboxDriver } from "./driver.ts";
-import type { CoveFiles } from "./files.ts";
+import { apiErrorStatus } from "./errors.ts";
+import { type CoveFiles, filesFor } from "./files.ts";
 import { withRateLimitRetry } from "./retry.ts";
 
 /** The part of `CoveClient` the provisioning factory uses. */
@@ -42,6 +34,15 @@ export interface CoveProvisioningClient {
 }
 
 export const DEFAULT_CWD = "/workspace";
+
+/**
+ * An SDK API error with this status (and code, when given), recognised by
+ * shape so a client from another copy of the SDK classifies the same.
+ */
+function isStatus(err: unknown, status: number, code?: string): boolean {
+  const http = apiErrorStatus(err);
+  return http?.status === status && (code === undefined || http.code === code);
+}
 export const DEFAULT_ID_TAG = "flue-id";
 
 /** Options shared by both factories. */
@@ -49,8 +50,8 @@ export interface CoveSandboxOptions extends Pick<CoveDriverOptions, "onOutput" |
   /** The sandbox's working directory, created with `mkdir -p` if missing. Default `/workspace`. */
   cwd?: string;
   /**
-   * The file-API client. Defaults to the one registered for a client built by
-   * `fromEnv()`/`createCoveClient()`. `false` moves all file content over exec.
+   * The file-API client. Defaults to the client's own `vms.files` (every
+   * `CoveClient` has one). `false` moves all file content over exec.
    */
   files?: CoveFiles | false;
 }
@@ -64,7 +65,7 @@ function isClientOptions(value: ClientInput): value is CoveClientOptions {
 function resolveFiles(client: object, files: CoveFiles | false | undefined): CoveFiles | undefined {
   if (files === false) return undefined;
   if (files) return files;
-  return filesFor(client as CoveClient);
+  return filesFor(client);
 }
 
 function driverOptions(files: CoveFiles | undefined, opts: CoveSandboxOptions): CoveDriverOptions {
@@ -81,8 +82,8 @@ async function sandboxOn(driver: CoveSandboxDriver, cwd: string): Promise<Sandbo
 }
 
 /**
- * A `SandboxFactory` over an existing VM. Pass a `CoveClient` (ideally one
- * from `fromEnv()`, which brings the file API with it) or client options.
+ * A `SandboxFactory` over an existing VM. Pass a `CoveClient` (for example
+ * from `fromEnv()`) or client options.
  * Every `createSandbox` call, whatever its id, targets `vmName`.
  */
 export function cove(
@@ -265,7 +266,7 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
     try {
       return await rl(() => vms.waitForState(name, states, { timeoutMs: left() }));
     } catch (err) {
-      if (err instanceof NotFoundError) throw err;
+      if (isStatus(err, 404)) throw err;
       left(); // turn a budget overrun into the readiness error
       throw err;
     }
@@ -290,7 +291,7 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
     try {
       return await reviveOnce(vm, left, round);
     } catch (err) {
-      if (err instanceof NotFoundError) return false;
+      if (isStatus(err, 404)) return false;
       throw err;
     }
   }
@@ -314,7 +315,7 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
       else if (how === "resume") await rl(() => vms.resume(vm.name));
       else await rl(() => vms.wake(vm.name));
     } catch (err) {
-      if (!(err instanceof ConflictError && err.code === "invalid_state_transition")) throw err;
+      if (!isStatus(err, 409, "invalid_state_transition")) throw err;
       // Someone else moved the VM first (another process reviving it, or
       // hibernating it). Give that transition a moment (Cove has no
       // "starting" state, so a VM being started can still read "stopped"),
@@ -420,7 +421,7 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
     try {
       await rl(() => vms.delete(name));
     } catch (err) {
-      if (err instanceof NotFoundError) return;
+      if (isStatus(err, 404)) return;
       throw err;
     }
     const deadline = Date.now() + deleteTimeoutMs;
@@ -429,7 +430,7 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
         const vm = await rl(() => vms.get(name));
         if (vm.state === "deleted") return;
       } catch (err) {
-        if (err instanceof NotFoundError) return;
+        if (isStatus(err, 404)) return;
         throw err;
       }
       if (Date.now() > deadline) {
@@ -485,8 +486,7 @@ async function retryReservedName<T>(create: () => Promise<T>): Promise<T> {
     try {
       return await withRateLimitRetry(create);
     } catch (err) {
-      const reserved =
-        err instanceof CoveAPIError && err.status === 400 && /name is reserved/i.test(err.message);
+      const reserved = isStatus(err, 400) && /name is reserved/i.test((err as Error).message);
       if (!reserved || attempt >= 3) throw err;
     }
   }

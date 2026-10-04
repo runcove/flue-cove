@@ -14,7 +14,7 @@
  * so spaces, quotes, newlines and leading dashes all survive.
  */
 import { randomUUID } from "node:crypto";
-import { CoveAPIError, type CoveClient, type ExecEvent, type InjectSelector } from "@cove/sdk";
+import type { CoveClient, ExecEvent, InjectSelector } from "@cove/sdk";
 import {
   type FileStat,
   SandboxDiedError,
@@ -22,6 +22,7 @@ import {
   SandboxOperationUnsupportedError,
   type ShellResult,
 } from "@flue/runtime";
+import { apiErrorStatus, isPlainCoveError } from "./errors.ts";
 import { type CoveFiles, fileErrorStatus } from "./files.ts";
 import { buildScript } from "./quote.ts";
 import {
@@ -80,6 +81,19 @@ interface ExecOptions {
 export function timeoutSecsFor(timeoutMs: number | undefined): number | undefined {
   if (timeoutMs === undefined) return undefined;
   return Math.max(1, Math.ceil(timeoutMs / 1000));
+}
+
+/**
+ * The deadline for one upload, in place of the client's `timeoutMs`, which
+ * would otherwise bound the whole transfer: a client built with a short
+ * deadline for its API calls would cut large writes off. The server ends a
+ * transfer that averages under 256 KiB/s (60 s at the least), so allow twice
+ * that, plus a minute. Downloads need nothing: the SDK bounds only their
+ * headers by `timeoutMs`.
+ */
+export function uploadTimeoutMs(bytes: number): number {
+  const serverBoundMs = Math.max(60_000, Math.ceil((bytes / (256 * 1024)) * 1000));
+  return 60_000 + 2 * serverBoundMs;
 }
 
 /** Largest raw chunk per exec on the write fallback: its base64 stays well under MAX_ARG_STRLEN (128 KiB). */
@@ -235,6 +249,14 @@ export class CoveSandboxDriver implements SandboxDriver {
   /** The key lacks files:read (or files:write): skip the API from then on. */
   #readScopeDenied = false;
   #writeScopeDenied = false;
+  /**
+   * Whether the server serves the file API at all. Its routes are newer than
+   * some servers still in use, which answer every `/files` request with
+   * their router's bare 404. `unknown` until a call proves it either way.
+   */
+  #fileRoute: "unknown" | "present" | "absent" = "unknown";
+  /** The one in-flight probe for {@link #fileRoute}, shared by concurrent callers. */
+  #routeProbe: Promise<"unknown" | "present" | "absent"> | undefined;
 
   constructor(client: CoveExecClient, vm: string, options: CoveDriverOptions = {}) {
     this.#client = client;
@@ -247,6 +269,15 @@ export class CoveSandboxDriver implements SandboxDriver {
   /** The VM this driver targets. */
   get vm(): string {
     return this.#vm;
+  }
+
+  /**
+   * What the driver knows about the server's file route: `present`,
+   * `absent` (file operations then run over exec), or `unknown` until a
+   * file-API call or the route probe has answered.
+   */
+  get fileRoute(): "unknown" | "present" | "absent" {
+    return this.#fileRoute;
   }
 
   // ─── exec ────────────────────────────────────────────────────────────────
@@ -384,7 +415,8 @@ export class CoveSandboxDriver implements SandboxDriver {
       void this.#killGroup(pidFile);
       return err;
     }
-    if (err instanceof CoveAPIError && vmGone(err.status, err.code)) return died("exec");
+    const http = apiErrorStatus(err);
+    if (http && vmGone(http.status, http.code)) return died("exec");
     return err;
   }
 
@@ -441,7 +473,8 @@ export class CoveSandboxDriver implements SandboxDriver {
         else throw new Error(`Cove exec on ${this.#vm} failed during ${operation}: ${ev.error}`);
       }
     } catch (err) {
-      if (err instanceof CoveAPIError && vmGone(err.status, err.code)) throw died(operation);
+      const http = apiErrorStatus(err);
+      if (http && vmGone(http.status, http.code)) throw died(operation);
       throw err;
     }
     throw new Error(`Cove exec on ${this.#vm} ended without an exit status during ${operation}`);
@@ -463,6 +496,53 @@ export class CoveSandboxDriver implements SandboxDriver {
     return res.stdout;
   }
 
+  /** The file client for reads (stat, download) or writes, or `undefined` to use exec. */
+  #filesFor(direction: "read" | "write"): CoveFiles | undefined {
+    if (this.#fileRoute === "absent") return undefined;
+    if (direction === "read" ? this.#readScopeDenied : this.#writeScopeDenied) return undefined;
+    return this.#files;
+  }
+
+  /** A file-API call that answered: the route exists. */
+  #routeSeen(): void {
+    this.#fileRoute = "present";
+  }
+
+  /**
+   * Whether the server lacks the file route, for a HEAD that answered a bare
+   * 404. A HEAD error has no body, so that 404 may be a missing file, a
+   * missing VM or a missing route. A server with the route answers 404 only
+   * after it has found the VM, and refuses the path `/` (an empty component)
+   * with 400 before any guest call; a server without it answers its
+   * router's bare 404 to that probe too. Probed once per driver. A probe that
+   * gets no HTTP answer decides nothing and is tried again next time.
+   */
+  async #routeAbsent(files: CoveFiles): Promise<boolean> {
+    if (this.#fileRoute !== "unknown") return this.#fileRoute === "absent";
+    this.#routeProbe ??= (async () => {
+      try {
+        await withRateLimitRetry(() => files.stat(this.#vm, "/"), FILE_RETRY);
+        return "present" as const;
+      } catch (err) {
+        // Only the two answers that settle it are recorded. With the route,
+        // `admit()` refuses `/` (an empty component) with 400 once the VM is
+        // found, before any guest call, so no 409 can come first. Without it,
+        // the router's bare 404. Anything else (no answer, a 429 or 503 past
+        // the retries, a proxy's 5xx, a 401, a 403 from the scope gate in
+        // front of every route) says nothing about the route: probe again
+        // next time.
+        const http = apiErrorStatus(err);
+        if (http?.status === 400) return "present" as const;
+        if (http?.status === 404 && http.code === undefined) return "absent" as const;
+        return "unknown" as const;
+      }
+    })();
+    const found = await this.#routeProbe;
+    this.#routeProbe = undefined;
+    if (found !== "unknown" && this.#fileRoute === "unknown") this.#fileRoute = found;
+    return this.#fileRoute === "absent";
+  }
+
   /** Classify a file-API failure: rethrow as the right error, or return to fall back. */
   #fileFailure(
     err: unknown,
@@ -471,7 +551,24 @@ export class CoveSandboxDriver implements SandboxDriver {
     path: string,
   ): void {
     const http = fileErrorStatus(err);
-    if (!http) throw err;
+    if (!http) {
+      // A 200 the SDK refused to trust (no Content-Length, or a compressed
+      // body whose length no longer counts its bytes): the shell can still
+      // stat and read the file. A truncated download is never one of these.
+      if (op !== "upload" && isPlainCoveError(err)) return;
+      throw err;
+    }
+    // Only the file route's own handlers send these codes. Not 401 or
+    // `scope_denied` (the auth gate in front of every route), not
+    // `vm_not_found` or `unavailable` (other handlers send them too).
+    if (http.code !== undefined && FILE_ROUTE_CODES.has(http.code)) this.#routeSeen();
+    // A GET or PUT 404 from a server with the file route always names what is
+    // missing (`vm_not_found` or `file_not_found`); one with no code is the
+    // router of a server that predates the route. Use exec from now on.
+    if (op !== "stat" && http.status === 404 && http.code === undefined) {
+      this.#fileRoute = "absent";
+      return;
+    }
     if (vmGone(http.status, http.code)) throw died(operation);
     // A HEAD 404 has no code, so it may also mean the VM is gone; reporting
     // ENOENT then is the closest honest answer (the next exec will say more).
@@ -490,10 +587,15 @@ export class CoveSandboxDriver implements SandboxDriver {
   }
 
   async readFileBuffer(path: string): Promise<Uint8Array> {
-    const files = this.#readScopeDenied ? undefined : this.#files;
+    const files = this.#filesFor("read");
     if (files) {
       try {
-        return await withRateLimitRetry(() => files.downloadBytes(this.#vm, path), FILE_RETRY);
+        const bytes = await withRateLimitRetry(
+          () => files.downloadBytes(this.#vm, path),
+          FILE_RETRY,
+        );
+        this.#routeSeen();
+        return bytes;
       } catch (err) {
         this.#fileFailure(err, "download", "readFile", path);
       }
@@ -503,10 +605,15 @@ export class CoveSandboxDriver implements SandboxDriver {
 
   async writeFile(path: string, content: string | Uint8Array): Promise<void> {
     const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
-    const files = this.#writeScopeDenied ? undefined : this.#files;
+    const files = this.#filesFor("write");
     if (files) {
       try {
-        await withRateLimitRetry(() => files.upload(this.#vm, path, bytes), FILE_RETRY);
+        const timeoutMs = uploadTimeoutMs(bytes.byteLength);
+        await withRateLimitRetry(
+          () => files.upload(this.#vm, path, bytes, { timeoutMs }),
+          FILE_RETRY,
+        );
+        this.#routeSeen();
         return;
       } catch (err) {
         this.#fileFailure(err, "upload", "writeFile", path);
@@ -547,17 +654,21 @@ export class CoveSandboxDriver implements SandboxDriver {
   }
 
   async stat(path: string): Promise<FileStat> {
-    const files = this.#readScopeDenied ? undefined : this.#files;
+    const files = this.#filesFor("read");
     if (files) {
       try {
         const info = await withRateLimitRetry(() => files.stat(this.#vm, path), FILE_RETRY);
+        this.#routeSeen();
         // A 200 means a regular file with no symlink anywhere in its path.
         // HEAD carries no modification time, so mtime is left out (runcove-1cl10).
         const st: FileStat = { isFile: true, isDirectory: false, isSymbolicLink: false };
         if (Number.isFinite(info.size)) st.size = info.size;
         return st;
       } catch (err) {
-        this.#fileFailure(err, "stat", "stat", path);
+        // A bare HEAD 404 on a server without the file route: ask the shell.
+        if (!(isBare404(err) && (await this.#routeAbsent(files)))) {
+          this.#fileFailure(err, "stat", "stat", path);
+        }
       }
     }
     const out = (await this.#must("stat", path, ["sh", "-c", STAT, "sh", path])).trim();
@@ -580,15 +691,19 @@ export class CoveSandboxDriver implements SandboxDriver {
 
   async exists(path: string): Promise<boolean> {
     try {
-      const files = this.#readScopeDenied ? undefined : this.#files;
+      const files = this.#filesFor("read");
       if (files) {
         try {
           await withRateLimitRetry(() => files.stat(this.#vm, path), FILE_RETRY);
+          this.#routeSeen();
           return true;
         } catch (err) {
           // 404 (file or, for a HEAD, possibly the VM: HEAD errors carry no
-          // code, runcove-1cl10) reads as "not there".
-          if (fileErrorStatus(err)?.status === 404) return false;
+          // code, runcove-1cl10) reads as "not there", unless the server has
+          // no file route at all, which the shell then answers for.
+          if (fileErrorStatus(err)?.status === 404 && !(await this.#routeAbsent(files))) {
+            return false;
+          }
           // Anything else (directory, symlink, denied, transport): ask the shell.
         }
       }
@@ -625,6 +740,20 @@ export class CoveSandboxDriver implements SandboxDriver {
     const flags = `${options?.recursive ? "r" : ""}${options?.force ? "f" : ""}`;
     await this.#must("rm", path, flags ? ["rm", `-${flags}`, "--", path] : ["rm", "--", path]);
   }
+}
+
+/** Error codes only the file-transfer handlers send: an answer with one proves the route. */
+const FILE_ROUTE_CODES = new Set([
+  "file_not_found",
+  "file_not_regular",
+  "file_path_denied",
+  "file_too_large",
+]);
+
+/** A 404 with no code: what a HEAD error (no body) or a missing route answers. */
+function isBare404(err: unknown): boolean {
+  const http = fileErrorStatus(err);
+  return http?.status === 404 && http.code === undefined;
 }
 
 function withNote(stderr: string, note: string): string {

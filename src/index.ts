@@ -6,7 +6,9 @@
  * - `CoveSandboxDriver`: the `SandboxDriver` itself, for custom wiring.
  * - `fromEnv()`: a `CoveClient` from `COVE_API_URL` + `COVE_API_KEY`/`COVE_API_KEY_FILE`.
  */
-export { createCoveClient, type FromEnvOptions, filesFor, fromEnv } from "./client.ts";
+/** The bundled SDK's client, so an application can build one from the same copy. */
+export { CoveClient, type CoveClientOptions } from "@cove/sdk";
+export { createCoveClient, type FromEnvOptions, fromEnv } from "./client.ts";
 export {
   type CoveDriverOptions,
   type CoveExecClient,
@@ -14,6 +16,7 @@ export {
   type OutputStream,
   timeoutSecsFor,
 } from "./driver.ts";
+export { apiErrorStatus } from "./errors.ts";
 export {
   type CoveProvisioningClient,
   type CoveSandboxOptions,
@@ -26,19 +29,19 @@ export {
 } from "./factory.ts";
 export {
   type CoveFileDownload,
-  CoveFileError,
   type CoveFileInfo,
   type CoveFiles,
   type CoveFilesCallOptions,
+  type CoveFilesResource,
   type CoveFileUploaded,
   type CoveUploadOptions,
-  createFetchFiles,
   DownloadTruncatedError,
-  type FetchFilesOptions,
   FileNotRegularError,
   FilePathDeniedError,
   FileTooLargeError,
   fileErrorStatus,
+  filesFor,
+  sdkFiles,
   UnavailableError,
   VmFileNotFoundError,
 } from "./files.ts";

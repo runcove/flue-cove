@@ -13,6 +13,9 @@ conversation, reached over the Cove API with the Cove TypeScript SDK
   It never creates or deletes anything.
 - `CoveSandboxDriver` implements Flue's `SandboxDriver`, for custom wiring.
 - `fromEnv()` builds a `CoveClient` from environment variables.
+- `CoveClient` is re-exported from the bundled `@cove/sdk`. A client built
+  from another copy of the SDK works too: the adapter recognises its errors
+  by their HTTP `status` and API `code`, not by class.
 
 It implements Flue's [Sandbox Adapter API](https://flueframework.com/docs/reference/sandbox-api/)
 (`@flue/runtime` 2.2.x) and imports only public `@flue/runtime` exports.
@@ -20,7 +23,7 @@ It implements Flue's [Sandbox Adapter API](https://flueframework.com/docs/refere
 ## Install
 
 `@cove/sdk` is not on a public registry, so this repository vendors it
-(`vendor/cove-sdk-0.4.0.tgz`; see [vendor/README.md](vendor/README.md)).
+(`vendor/cove-sdk-0.4.0-cb09494.tgz`; see [vendor/README.md](vendor/README.md)).
 Install `flue-cove` from a clone or from a packed tarball, next to
 `@flue/runtime` (a peer dependency):
 
@@ -31,8 +34,8 @@ cd flue-cove && npm ci && npm run build
 cd ../my-flue-app && npm install --install-links ../flue-cove @flue/runtime@2.2.2
 
 # or from a tarball (the SDK is bundled inside it)
-cd flue-cove && npm pack            # → flue-cove-0.1.0.tgz
-cd ../my-flue-app && npm install ../flue-cove/flue-cove-0.1.0.tgz @flue/runtime@2.2.2
+cd flue-cove && npm pack            # → flue-cove-0.2.0.tgz
+cd ../my-flue-app && npm install ../flue-cove/flue-cove-0.2.0.tgz @flue/runtime@2.2.2
 ```
 
 Install a *copy*, never a symlink: a plain `npm install ../flue-cove` links
@@ -43,6 +46,13 @@ errors with `instanceof`. `--install-links` (or `install-links=true` in your
 `.npmrc`, as `examples/repo-agent` has) or the tarball avoids that.
 
 Node.js 22.19 or newer, ESM only (Flue's own requirements).
+
+**Cove server.** The file API (`HEAD`/`GET`/`PUT /api/vms/{name}/files`) needs
+a server build that includes Cove commit `537fb91a3` (the file-transfer
+endpoints), or the first release after `cove-server` 0.33.2; the 0.33.2 tag
+itself has no file routes. A pre-release build with them may still report
+version 0.33.2. Older servers work too, more slowly: the adapter notices that
+the route is missing and runs every file operation over exec.
 
 ## Configuration
 
@@ -139,7 +149,8 @@ the adapter.
   `{ kind: "setup_tag", tag }`). Every `exec` then goes through
   `execWithSecrets`, which Cove buffers (no live output, no `onOutput`) and
   gives no server-side deadline; the adapter enforces `timeoutMs` itself;
-- `files`: a file-API client, or `false` to move all file content over exec.
+- `files`: a file-API client (default: the client's own `client.vms.files`),
+  or `false` to move all file content over exec.
 
 ## Lifecycle and cleanup
 
@@ -189,13 +200,32 @@ to exec: a symlink anywhere in the path or a non-regular target (422
 `file_not_regular`), a path on the API's deny-list such as `/proc` (403
 `file_path_denied`), a guest agent that predates the API (409
 `guest_agent_too_old`), a key without `files:read`/`files:write` (403
-`scope_denied`), and a path the API's syntax rules reject (400). On
+`scope_denied`), a path the API's syntax rules reject (400), and a server
+without the file API at all (below). On
 Ubuntu `/bin`, `/lib` and `/sbin` are symlinks, so paths under them always use
 the fallback. 404 is `ENOENT`. 413 `file_too_large` is an error for
 `readFile`/`readFileBuffer`/`writeFile`; `stat` and `exists` fall back to exec
 on it, since a shell can still stat a file too big to transfer. A VM that is not running or is gone becomes Flue's
 `SandboxDiedError`, as does a `paused` event in the middle of an exec. 429
-(rate limit) and file-API 503 (`unavailable`) are retried with backoff.
+(rate limit) and file-API 503 (`unavailable`) are retried with backoff. A
+`200` the SDK cannot trust (no readable `Content-Length`, or a
+`Content-Encoding` such as gzip added by a proxy) also sends `stat`, `exists`
+and reads to exec. A download whose body stops short of its `Content-Length`
+(`DownloadTruncatedError`) fails and is never retried over exec: it is never
+taken for a complete file.
+
+A server that predates the file API answers every `/files` request with its
+router's bare 404, which has no error code. The real route always names what
+is missing on a `GET` or `PUT` (`vm_not_found` or `file_not_found`), so a
+codeless 404 there means "no route". A `HEAD` error never has a body, so the
+first bare `HEAD` 404 is checked once per driver with a probe: `HEAD` of the
+path `/`, which the route refuses with 400 before touching the guest and an
+old server answers with the same bare 404. Only those two answers are
+recorded. Anything else (no answer, a 429 or 5xx after the retries, a 401 or
+403 from the auth gate) decides nothing, and the next bare `HEAD` 404 probes
+again. Once the route is known to be missing, every file operation runs over
+exec. `CoveSandboxDriver.fileRoute`
+reports what the driver found.
 
 Every option Flue defines (`exec`'s `cwd`, `env`, `timeoutMs`, `signal`;
 `mkdir`'s `recursive`; `rm`'s `recursive` and `force`) is honoured exactly. An
@@ -208,7 +238,7 @@ are safe.
 
 ## Limitations
 
-These were measured against a Cove 0.33.2 server.
+These were measured against a Cove server built after 0.33.2 that includes the file API (it reports version 0.33.2).
 
 - **Shell.** Commands run under `bash` when the guest has it (so `[[ ]]` and
   `set -o pipefail` work), otherwise under `sh`.
@@ -240,6 +270,11 @@ These were measured against a Cove 0.33.2 server.
 - **Size cap.** The file API refuses files above the server's `[files]
   max_bytes` (100 MiB by default) with 413. Reads and writes of such a file
   fail; there is no exec fallback for content (`stat`/`exists` still work).
+- **Timeouts on transfers.** A client's `timeoutMs` does not cut file
+  transfers short. Each upload gets its own deadline from its size: twice
+  the time the server allows at its 256 KiB/s floor, plus a minute, and
+  never under three minutes. For downloads, the SDK applies `timeoutMs` to
+  the response headers only.
 - **File-API writes** create files owned by root, keep an existing file's mode
   and use `0644` for a new one.
 - **Rate limit.** Cove limits each source address (30 requests/s by default).
@@ -253,7 +288,7 @@ These were measured against a Cove 0.33.2 server.
 
 | Command | What it proves |
 |---|---|
-| `npm test` | Unit tests with no Cove server: quoting through a real `sh`, env-name validation, timeout rounding, every exec terminal event (`exit`, `error`, `paused`, timeout → 124), abort and timeout killing the process group, every file-API status and its fallback (a filesystem-backed fake with Cove's rules, plus the fetch client against a mock `fetch`), short bodies, 429/503 retries, id dedupe and reuse, release, and that the API key never leaks into errors or serialized objects |
+| `npm test` | Unit tests with no Cove server: quoting through a real `sh`, env-name validation, timeout rounding, every exec terminal event (`exit`, `error`, `paused`, timeout → 124), abort and timeout killing the process group, every file-API status and its fallback (a filesystem-backed fake with Cove's rules that throws the SDK's own errors), the SDK's file methods through a real `CoveClient` against a mock `fetch` (path encoding, error classes and codes, short bodies), 429/503 retries, id dedupe and reuse, release, and that the API key never leaks into errors or serialized objects |
 | `npm run test:integration` | Against a live Cove server (skipped without `COVE_API_URL` and a key): creates a VM through `coveVms`, runs every Sandbox operation through Flue's `sandboxFromDriver` (text, binary and multi-MiB files, symlinked paths, directories, quoted/dashed/newline paths, `/proc`, the timeout, abort, a non-zero exit, `cwd` and `env`, a VM paused mid-exec), checks reuse by id, and deletes the VM in `after` |
 | `cd examples/repo-agent && npm ci && npm run smoke` (after `npm ci` at the repository root) | The example agent through Flue's real runtime (`start`, `init`, `dispatch`) on a real VM, with Pi's faux model provider replaying a scripted session of `bash`/`write`/`read` tool calls, then `release`; also checks that the adapter's errors are `instanceof` the app's own `FlueError` |
 
@@ -278,14 +313,18 @@ npm run build          # tsc → dist/
 COVE_API_URL=https://<cove-host> COVE_API_KEY_FILE=~/.cove/api_key npm run test:integration
 ```
 
-`src/files.ts` is a stop-gap: `@cove/sdk` 0.4.0 has no file-transfer methods,
-so it carries a small fetch client for `HEAD`/`GET`/`PUT /api/vms/{name}/files`.
-Its `CoveFiles` interface (`stat`, `download`, `downloadBytes`, `upload`) and
-its error classes (`FileTooLargeError`, `FilePathDeniedError`,
+File transfer uses the SDK's `client.vms.files` (`stat`, `download`,
+`downloadBytes`, `upload`). `src/files.ts` wraps it in a small `CoveFiles`
+interface, so tests can hand the driver a fake, and re-exports the SDK's file
+error classes (`FileTooLargeError`, `FilePathDeniedError`,
 `VmFileNotFoundError`, `FileNotRegularError`, `UnavailableError`,
-`DownloadTruncatedError`) mirror the `client.vms.files` API the SDK is adding,
-and the driver classifies errors only through `fileErrorStatus`. When the SDK
-ships them, that one file becomes a thin wrapper and nothing else changes.
+`DownloadTruncatedError`). The driver classifies a failure only by its HTTP
+status and API `code` (`fileErrorStatus`), never by its message. A key
+without `files:read`/`files:write` is the SDK's plain `PermissionDeniedError`
+with code `scope_denied`; a `HEAD` error has no body, so `stat`'s 403 and 404
+carry no code. The SDK does not retry 429s; the driver does.
+
+Changes, including breaking ones, are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

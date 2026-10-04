@@ -142,8 +142,8 @@ function fakeCove(
 }
 
 const noFiles: CoveFiles = {
-  stat: async () => ({ size: 0 }),
-  download: async () => ({ size: 0, body: new Blob([]).stream() }),
+  stat: async () => ({ size: 0, mode: undefined }),
+  download: async () => ({ size: 0, mode: undefined, body: new Blob([]).stream() }),
   downloadBytes: async () => new Uint8Array(),
   upload: async (_vm, path) => ({ path, size: 0, mode: 0o644, sha256: "" }),
 };
@@ -555,5 +555,38 @@ describe("cove(): the pure adapter", () => {
 
   it("accepts client options instead of a client", () => {
     assert.doesNotThrow(() => cove({ baseUrl: "https://cove.example.com", token: "cvk_x" }, "v"));
+  });
+});
+
+describe("errors from another @cove/sdk copy (classified by shape)", () => {
+  /** An API error that is not an instance of this package's SDK classes. */
+  const foreign = (status: number, code: string) =>
+    Object.assign(new Error(`HTTP ${status}: ${code}`), { name: "ConflictError", status, code });
+
+  it("a foreign 409 invalid_state_transition while reviving still waits for the VM", async () => {
+    const fake = fakeCove();
+    fake.vms.set("old", { name: "old", state: "stopped", tags: { "flue-id": "f" } });
+    let starts = 0;
+    fake.client.vms.start = async (name) => {
+      starts++;
+      const vm = fake.vms.get(name);
+      if (vm) setTimeout(() => (vm.state = "running"), 5);
+      throw foreign(409, "invalid_state_transition");
+    };
+    await coveVms({ client: fake.client, files: noFiles }).createSandbox({ id: "f" });
+    assert.equal(starts, 1);
+    assert.equal(fake.creates.length, 0);
+  });
+
+  it("a foreign 404 on delete counts as already gone", async () => {
+    const fake = fakeCove();
+    const factory = coveVms({ client: fake.client, files: noFiles });
+    await factory.createSandbox({ id: "g" });
+    const realDelete = fake.client.vms.delete;
+    fake.client.vms.delete = async (name, ...rest) => {
+      await realDelete(name, ...rest);
+      throw foreign(404, "vm_not_found");
+    };
+    await factory.release("g");
   });
 });

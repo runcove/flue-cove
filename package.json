@@ -1,6 +1,6 @@
 {
   "name": "flue-cove",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Flue sandbox adapter backed by Cove microVMs",
   "type": "module",
@@ -33,7 +33,7 @@
     "@flue/runtime": "^2.2.2"
   },
   "dependencies": {
-    "@cove/sdk": "file:vendor/cove-sdk-0.4.0.tgz"
+    "@cove/sdk": "file:vendor/cove-sdk-0.4.0-cb09494.tgz"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",

@@ -2,16 +2,16 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { CoveAPIError, RateLimitError } from "@cove/sdk";
 import { CoveSandboxDriver } from "../src/driver.ts";
-import { CoveFileError, type CoveFiles } from "../src/files.ts";
+import type { CoveFiles } from "../src/files.ts";
 import { isRateLimited, withRateLimitRetry } from "../src/retry.ts";
-import { scriptedClient } from "./helpers.ts";
+import { apiError, scriptedClient } from "./helpers.ts";
 
 const limited = () => new RateLimitError(429, "HTTP 429: Too Many Requests");
 
 describe("rate limiting (429)", () => {
-  it("recognises the SDK's and the file client's 429s, nothing else", () => {
+  it("recognises the SDK's 429s, nothing else", () => {
     assert.equal(isRateLimited(limited()), true);
-    assert.equal(isRateLimited(new CoveFileError(429, undefined, "slow down")), true);
+    assert.equal(isRateLimited(apiError(429)), true);
     assert.equal(isRateLimited(new CoveAPIError(503, "busy")), false);
     assert.equal(isRateLimited(new Error("429")), false);
   });
@@ -89,12 +89,12 @@ describe("rate limiting (429)", () => {
   it("file operations retry a 503 unavailable, then give up", async () => {
     let n = 0;
     const files: CoveFiles = {
-      stat: async () => ({ size: 0 }),
+      stat: async () => ({ size: 0, mode: undefined }),
       upload: async () => {
         n++;
-        throw new CoveFileError(503, "unavailable", "guest agent timed out");
+        throw apiError(503, "unavailable", "guest agent timed out");
       },
-      download: async () => ({ size: 0, body: new Blob([]).stream() }),
+      download: async () => ({ size: 0, mode: undefined, body: new Blob([]).stream() }),
       downloadBytes: async () => new Uint8Array(),
     };
     const { client } = scriptedClient(() => []);
@@ -106,11 +106,11 @@ describe("rate limiting (429)", () => {
   it("file operations retry a 429", async () => {
     let n = 0;
     const files: CoveFiles = {
-      stat: async () => ({ size: 0 }),
+      stat: async () => ({ size: 0, mode: undefined }),
       upload: async (_vm, path) => ({ path, size: 0, mode: 0o644, sha256: "" }),
-      download: async () => ({ size: 0, body: new Blob([]).stream() }),
+      download: async () => ({ size: 0, mode: undefined, body: new Blob([]).stream() }),
       downloadBytes: async () => {
-        if (++n < 2) throw new CoveFileError(429, undefined, "slow down");
+        if (++n < 2) throw apiError(429);
         return new TextEncoder().encode("data");
       },
     };

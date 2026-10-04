@@ -310,23 +310,25 @@ describe("the group-kill helper", () => {
   it("kills a single pid whose start time matches", async () => {
     const pidFile = join(dir, "p2.pid");
     const victim = spawn("sleep", ["30"], { stdio: "ignore" });
+    const closed = new Promise((r) => victim.on("close", r));
     await sleep(50);
     writeFileSync(pidFile, `p ${victim.pid} ${starttime(victim.pid as number)}`);
     await run(KILL_GROUP, pidFile);
-    await new Promise((r) => victim.on("close", r));
+    await closed;
     assert.equal(alive(victim.pid as number), false);
   });
 
   it("waits briefly for a pid file that does not exist yet", async () => {
     const pidFile = join(dir, "late.pid");
     const victim = spawn("sleep", ["30"], { stdio: "ignore" });
+    const closed = new Promise((r) => victim.on("close", r));
     await sleep(50);
     setTimeout(
       () => writeFileSync(pidFile, `p ${victim.pid} ${starttime(victim.pid as number)}`),
       300,
     );
     await run(KILL_GROUP, pidFile);
-    await new Promise((r) => victim.on("close", r));
+    await closed;
     assert.equal(alive(victim.pid as number), false);
   });
 

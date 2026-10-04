@@ -24,7 +24,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "biome check .",
     "format": "biome check --write .",
-    "test": "node --test --test-reporter=spec \"test/*.test.ts\"",
+    "test": "node --test --test-reporter=spec --test-timeout=60000 \"test/*.test.ts\"",
     "test:integration": "node --test --test-reporter=spec --test-concurrency=1 \"test/integration/*.test.ts\"",
     "check:vendor": "node scripts/check-vendor.mjs",
     "prepack": "npm run build"

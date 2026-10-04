@@ -33,7 +33,7 @@
     "@flue/runtime": "^2.2.2"
   },
   "dependencies": {
-    "@cove/sdk": "file:vendor/cove-sdk-0.4.0.tgz"
+    "@cove/sdk": "file:vendor/cove-sdk-0.4.0-cb09494.tgz"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",

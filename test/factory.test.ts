@@ -35,6 +35,8 @@ function fakeCove(
     applyTags?: boolean;
     /** The create was accepted, but the response never arrived. */
     createTransportError?: boolean;
+    /** How long after `running` the server applies the initial tags (default 20 ms). */
+    tagDelayMs?: number;
     tagSetFails?: boolean;
   } = {},
 ) {
@@ -74,8 +76,9 @@ function fakeCove(
           const vm = vms.get(name);
           if (!vm) return;
           vm.state = opts.createOutcome ?? "running";
+          // Like cove-server: the tags land a little after the VM reports running.
           if (vm.state === "running" && opts.applyTags !== false) {
-            Object.assign(vm.tags, req.initial_tags ?? {});
+            setTimeout(() => Object.assign(vm.tags, req.initial_tags ?? {}), opts.tagDelayMs ?? 20);
           }
         }, opts.createDelayMs ?? 5);
         if (opts.createTransportError) throw new CoveConnectionError("socket hang up");
@@ -274,9 +277,25 @@ describe("coveVms: id dedupe and reuse", () => {
 });
 
 describe("coveVms: tags and races", () => {
-  it("sets any initial tag the server has not applied once the VM is running", async () => {
-    const fake = fakeCove({ applyTags: false });
+  it("waits for tags that arrive late, without calling setVmTag", async () => {
+    const fake = fakeCove({ tagDelayMs: 150, tagSetFails: true });
     const factory = coveVms({ client: fake.client, files: noFiles, tags: { app: "x" } });
+    await factory.createSandbox({ id: "late" });
+    assert.deepEqual(fake.vms.get("vm-1")?.tags, { "flue-id": "late", app: "x" });
+    assert.deepEqual(
+      fake.log.filter((l) => l.startsWith("tag ")),
+      [],
+    );
+  });
+
+  it("sets the tags itself when they never arrive within the grace period", async () => {
+    const fake = fakeCove({ applyTags: false });
+    const factory = coveVms({
+      client: fake.client,
+      files: noFiles,
+      tags: { app: "x" },
+      tagGraceMs: 50,
+    });
     await factory.createSandbox({ id: "t" });
     assert.deepEqual(fake.vms.get("vm-1")?.tags, { "flue-id": "t", app: "x" });
     assert.ok(fake.log.includes("tag vm-1 flue-id=t"));
@@ -294,7 +313,7 @@ describe("coveVms: tags and races", () => {
   it("deletes the VM and throws when the tags cannot be set", async () => {
     const fake = fakeCove({ applyTags: false, tagSetFails: true });
     await assert.rejects(
-      coveVms({ client: fake.client, files: noFiles }).createSandbox({ id: "t" }),
+      coveVms({ client: fake.client, files: noFiles, tagGraceMs: 50 }).createSandbox({ id: "t" }),
       /tag/,
     );
     assert.equal(fake.vms.size, 0);
@@ -316,11 +335,44 @@ describe("coveVms: tags and races", () => {
     assert.equal(fake.creates.length, 0);
   });
 
+  it("after a revive 409 it waits for a settled state and revives from there", async () => {
+    const fake = fakeCove();
+    fake.vms.set("old", { name: "old", state: "stopped", tags: { "flue-id": "h" } });
+    fake.client.vms.start = async (name) => {
+      // Someone else hibernates it meanwhile; the VM moves through hibernating.
+      const vm = fake.vms.get(name);
+      if (vm) {
+        vm.state = "hibernating";
+        setTimeout(() => (vm.state = "hibernated"), 10);
+      }
+      throw new ConflictError(409, "invalid state transition", "invalid_state_transition");
+    };
+    await coveVms({ client: fake.client, files: noFiles }).createSandbox({ id: "h" });
+    assert.ok(fake.log.includes("wake old"));
+    assert.equal(fake.vms.get("old")?.state, "running");
+    assert.equal(fake.creates.length, 0);
+  });
+
+  it("gives up reviving after a bounded number of 409s", async () => {
+    const fake = fakeCove();
+    fake.vms.set("old", { name: "old", state: "stopped", tags: { "flue-id": "b" } });
+    let starts = 0;
+    fake.client.vms.start = async () => {
+      starts++;
+      throw new ConflictError(409, "invalid state transition", "invalid_state_transition");
+    };
+    await assert.rejects(
+      coveVms({ client: fake.client, files: noFiles, reuse: true }).createSandbox({ id: "b" }),
+      /revive/,
+    );
+    assert.ok(starts > 1 && starts <= 4, `starts=${starts}`);
+  });
+
   it("releaseAll also deletes a VM whose create response was lost", async () => {
     const fake = fakeCove({ createTransportError: true });
     const factory = coveVms({ client: fake.client, files: noFiles });
     await assert.rejects(factory.createSandbox({ id: "lost" }), /socket hang up/);
-    await sleep(20); // the server finished creating and tagged it
+    await sleep(80); // the server finished creating and tagged it
     await factory.releaseAll();
     assert.equal(fake.vms.size, 0);
   });

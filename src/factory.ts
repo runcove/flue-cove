@@ -129,6 +129,12 @@ export interface CoveVmsOptions extends CoveSandboxOptions {
   reuse?: boolean;
   /** How long to wait for a VM to reach `running`. Default 300 000 ms. */
   readyTimeoutMs?: number;
+  /**
+   * How long to wait, once a new VM is running, for Cove to apply its initial
+   * tags before setting missing ones itself (which needs `tags:write`).
+   * Default 30 000 ms.
+   */
+  tagGraceMs?: number;
   /** How long `release` waits for a deleted VM to disappear. Default 300 000 ms. */
   deleteTimeoutMs?: number;
 }
@@ -201,6 +207,7 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
   const cwd = options.cwd ?? DEFAULT_CWD;
   const readyTimeoutMs = options.readyTimeoutMs ?? 300_000;
   const deleteTimeoutMs = options.deleteTimeoutMs ?? 300_000;
+  const tagGraceMs = options.tagGraceMs ?? 30_000;
   const extraTags = { ...(options.tags ?? {}) };
   for (const [k, v] of Object.entries(extraTags)) checkTagValue(k, v);
 
@@ -243,29 +250,42 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
     }
   }
 
-  async function revive(vm: VmSummary): Promise<boolean> {
+  /** States a VM rests in; anything else is on its way somewhere. */
+  const SETTLED: VmState[] = ["running", "stopped", "paused", "hibernated", "failed", "deleted"];
+  const MAX_REVIVE_ROUNDS = 3;
+
+  async function revive(vm: VmSummary, round = 0): Promise<boolean> {
+    if (round > MAX_REVIVE_ROUNDS) {
+      throw new Error(
+        `could not revive Cove VM ${vm.name}: it was still changing state after ${MAX_REVIVE_ROUNDS} retries`,
+      );
+    }
     const how = REVIVE[vm.state];
     if (!how) return false;
     const vms = getClient().vms;
     if (how === "wait") {
       const settled = await rl(() =>
-        vms.waitForState(
-          vm.name,
-          ["running", "stopped", "paused", "hibernated", "failed", "deleted"],
-          { timeoutMs: readyTimeoutMs },
-        ),
+        vms.waitForState(vm.name, SETTLED, { timeoutMs: readyTimeoutMs }),
       );
       if (settled.state === "running") return true;
-      return revive({ ...vm, state: settled.state });
+      return revive({ ...vm, state: settled.state }, round + 1);
     }
     try {
       if (how === "start") await rl(() => vms.start(vm.name));
       else if (how === "resume") await rl(() => vms.resume(vm.name));
       else await rl(() => vms.wake(vm.name));
     } catch (err) {
-      // Another process got there first and the VM is already on its way to
-      // running: wait for it like they do.
       if (!(err instanceof ConflictError && err.code === "invalid_state_transition")) throw err;
+      // Someone else moved the VM first (another process reviving it, or
+      // hibernating it). Give that transition a moment (Cove has no
+      // "starting" state, so a VM being started can still read "stopped"),
+      // wait until it settles, then revive from there.
+      await new Promise((r) => setTimeout(r, 250 * (round + 1)));
+      const settled = await rl(() =>
+        vms.waitForState(vm.name, SETTLED, { timeoutMs: readyTimeoutMs }),
+      );
+      if (settled.state === "running") return true;
+      return revive({ ...vm, state: settled.state }, round + 1);
     }
     await waitRunning(vm.name);
     return true;
@@ -318,7 +338,17 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
    */
   async function ensureTags(name: string, wanted: Record<string, string>): Promise<void> {
     const c = getClient();
-    const have = (await rl(() => c.vms.get(name))).tags ?? {};
+    const missing = (have: Record<string, string>) =>
+      Object.entries(wanted).some(([k, v]) => have[k] !== v);
+    // cove-server applies initial_tags only after the whole create finishes,
+    // which is after the VM already reports running (about 0.1-0.2 s later
+    // on a dev server). Give the server the grace period before stepping in.
+    const deadline = Date.now() + tagGraceMs;
+    let have = (await rl(() => c.vms.get(name))).tags ?? {};
+    while (missing(have) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, Math.min(250, Math.max(0, deadline - Date.now()))));
+      have = (await rl(() => c.vms.get(name))).tags ?? {};
+    }
     for (const [key, value] of Object.entries(wanted)) {
       if (have[key] === value) continue;
       try {

@@ -65,7 +65,7 @@ named):
 | `vms:read` | `listVms`, `getVm` | finding a VM by tag, waiting for states, reading its tags |
 | `vms:write` | `createVm`, `startVm`, `resumeVm`, `wakeVm`, `deleteVm` | provisioning and `release` (`initial_tags` and `initial_secrets` ride on `createVm`) |
 | `vms:exec` | `execVm`, `execVmWithSecrets` | every command, and the exec fallbacks for files |
-| `tags:write` | `setVmTag` | only when Cove failed to apply a VM's initial tags (see below) |
+| `tags:write` | `setVmTag` | only if Cove has not applied a new VM's initial tags within `tagGraceMs` (see below); normally never called |
 | `files:read` | `statVmFile`, `downloadVmFile` | reads and stats |
 | `files:write` | `uploadVmFile` | writes |
 
@@ -127,7 +127,7 @@ configured tag.
 `coveVms(options)`: `client` (default `fromEnv()`), `image`, `cpus`,
 `memoryMb`, `diskSizeGb`, `team`, `tags`, `idTag` (default `flue-id`),
 `expiry: { maxLifetimeSecs }`, `initialSecrets`, `reuse` (default `true`),
-`readyTimeoutMs`, `deleteTimeoutMs`, and the options shared with `cove()`:
+`readyTimeoutMs`, `deleteTimeoutMs`, `tagGraceMs`, and the options shared with `cove()`:
 
 - `cwd`: the sandbox's working directory, created with `mkdir -p` (default `/workspace`);
 - `onOutput(chunk, stream)`: called with each output chunk as Cove streams it;
@@ -147,10 +147,13 @@ Flue never creates or destroys provider resources; the application does.
   creates one with those tags and waits for `running` (a VM that ends in
   `failed` is deleted and the call throws). So a conversation keeps its
   filesystem across messages and restarts.
-- Cove applies the tags only after the VM has been created, and only best
-  effort. Until then the VM cannot be found by tag. Once it is running, the
-  factory reads its tags and sets any that are missing (`tags:write`); if that
-  fails, it deletes the VM and throws.
+- Cove applies the tags only after the whole create has finished, which is
+  shortly after the VM already reports `running` (0.1-0.2 s on a test server),
+  and only best effort. Until then the VM cannot be found by tag. The factory
+  waits up to `tagGraceMs` (default 30 s) for them to appear. Only if some are
+  still missing then does it set them itself, which needs `tags:write`; if
+  that fails, it deletes the VM and throws. A key without `tags:write` works
+  as long as Cove applies the tags, which it normally does.
 - Concurrent calls with the same id share one provisioning. Two *processes*
   racing on a brand-new id can still create two VMs; `release(id)` deletes
   every VM carrying the id's tags, so neither leaks once both are tagged.

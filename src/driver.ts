@@ -122,6 +122,8 @@ export const KILL_GROUP =
   'elif [ "$m" != g ]; then exit 0; fi; ' +
   'if [ "$m" = g ]; then kill -s KILL -- "-$p" 2>/dev/null; else kill -s KILL "$p" 2>/dev/null; fi; exit 0';
 
+// Content and names travel as base64 because Cove drops a command's whole
+// output when it is not valid UTF-8 (runcove-gcin2).
 const READ_B64 = 'base64 < "$1"';
 const WRITE_ONE = 'printf %s "$1" | base64 -d > "$2"';
 const WRITE_START = 't=$(mktemp) && printf %s "$1" | base64 -d > "$t" && printf %s "$t"';
@@ -289,8 +291,9 @@ export class CoveSandboxDriver implements SandboxDriver {
           case "paused":
             throw died("exec");
           case "error":
-            // Cove reports an expired timeout_secs as an error event; the
-            // timeout(1) convention is a result with exit code 124.
+            // Cove reports an expired timeout_secs as an error event and kills
+            // only the direct child (runcove-cw62w); the timeout(1) convention
+            // is a result with exit code 124, and the group kill stops the rest.
             if (timeoutSecs !== undefined && /command timed out/i.test(ev.error)) {
               await this.#killGroup(pidFile);
               return {
@@ -539,7 +542,7 @@ export class CoveSandboxDriver implements SandboxDriver {
       try {
         const info = await withRateLimitRetry(() => files.stat(this.#vm, path), FILE_RETRY);
         // A 200 means a regular file with no symlink anywhere in its path.
-        // HEAD carries no modification time, so mtime is left out.
+        // HEAD carries no modification time, so mtime is left out (runcove-1cl10).
         const st: FileStat = { isFile: true, isDirectory: false, isSymbolicLink: false };
         if (Number.isFinite(info.size)) st.size = info.size;
         return st;
@@ -573,7 +576,8 @@ export class CoveSandboxDriver implements SandboxDriver {
           await withRateLimitRetry(() => files.stat(this.#vm, path), FILE_RETRY);
           return true;
         } catch (err) {
-          // 404 (file or, for a HEAD, possibly the VM) reads as "not there".
+          // 404 (file or, for a HEAD, possibly the VM: HEAD errors carry no
+          // code, runcove-1cl10) reads as "not there".
           if (fileErrorStatus(err)?.status === 404) return false;
           // Anything else (directory, symlink, denied, transport): ask the shell.
         }

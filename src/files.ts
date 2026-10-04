@@ -112,7 +112,7 @@ export function fileErrorStatus(
  * The error class for a status (and code, when the response had a body).
  * HEAD responses carry no body, so for `stat` only the status is known: a 404
  * may be a missing VM (`vm_not_found`) or a missing file, and a 403 or 422
- * cannot be told apart from their other causes. Those stay plain
+ * cannot be told apart from their other causes (runcove-1cl10). Those stay plain
  * `CoveFileError`s with no code, and the driver treats them accordingly.
  */
 function errorClassFor(status: number, code: string | undefined): typeof CoveFileError {

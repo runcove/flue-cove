@@ -3,7 +3,7 @@
  * address (a token bucket, 30 requests/s by default) and rejects the excess
  * before any handler runs, so a 429'd request did nothing and is safe to
  * resend, a POST included. `@cove/sdk` 0.4.0 does not expose `Retry-After`,
- * so the wait is a short exponential backoff with jitter.
+ * so the wait is a short exponential backoff with jitter (runcove-413g9).
  */
 import { CoveAPIError } from "@cove/sdk";
 import { fileErrorStatus } from "./files.ts";

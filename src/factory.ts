@@ -410,7 +410,8 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
 
 /**
  * Create, retrying 429s, and retrying (a few times) the 400 Cove answers when
- * the name it generated is already reserved by a leftover Warpgate target:
+ * the name it generated is already reserved by a leftover Warpgate target
+ * (runcove-p4n6l):
  * each attempt gets a fresh generated name. Any other 400 is final.
  */
 async function retryReservedName<T>(create: () => Promise<T>): Promise<T> {

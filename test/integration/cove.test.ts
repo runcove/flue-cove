@@ -79,6 +79,14 @@ describe("Cove integration", {
     assert.equal(r2.stdout, "/workspace/sub dir|it's $HOME");
   });
 
+  it("exec: commands run under bash ([[ ]], pipefail)", async () => {
+    const res = await sandbox.exec(
+      '[[ "a b" == "a b" ]] && echo ok; set -o pipefail; false | true; echo "pipe=$?"; echo "$BASH_VERSION" | cut -c1',
+    );
+    assert.equal(res.exitCode, 0);
+    assert.match(res.stdout, /^ok\npipe=1\n[0-9]\n$/);
+  });
+
   it("exec: a timeout is exit 124 with a note, and the command's process group is killed", async () => {
     const started = Date.now();
     const res = await sandbox.exec("echo before; (sleep 3; touch /tmp/timeout-marker) & sleep 30", {

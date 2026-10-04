@@ -28,12 +28,19 @@ Install `flue-cove` from a clone or from a packed tarball, next to
 # from a clone
 git clone <this repository> flue-cove
 cd flue-cove && npm ci && npm run build
-cd ../my-flue-app && npm install ../flue-cove @flue/runtime@2.2.2
+cd ../my-flue-app && npm install --install-links ../flue-cove @flue/runtime@2.2.2
 
 # or from a tarball (the SDK is bundled inside it)
 cd flue-cove && npm pack            # → flue-cove-0.1.0.tgz
 cd ../my-flue-app && npm install ../flue-cove/flue-cove-0.1.0.tgz @flue/runtime@2.2.2
 ```
+
+Install a *copy*, never a symlink: a plain `npm install ../flue-cove` links
+the clone, and the adapter then loads the clone's own development copy of
+`@flue/runtime`. Its `SandboxDiedError` and `SandboxOperationUnsupportedError`
+are then not `instanceof` your app's `FlueError`, and Flue classifies sandbox
+errors with `instanceof`. `--install-links` (or `install-links=true` in your
+`.npmrc`, as `examples/repo-agent` has) or the tarball avoids that.
 
 Node.js 22.19 or newer, ESM only (Flue's own requirements).
 
@@ -50,17 +57,22 @@ Node.js 22.19 or newer, ESM only (Flue's own requirements).
 The key never appears in errors, logs or a serialized client. Plain `http://`
 is refused unless the host is loopback.
 
-Scopes the key needs:
+Scopes the key needs (each is the `x-required-scope` of the API operations
+named):
 
-| Scope | For |
-|---|---|
-| `vms:read`, `vms:write` | finding, creating, starting and deleting VMs (`coveVms`) |
-| `vms:exec` | every command, and the exec fallbacks for files |
-| `tags:read`, `tags:write` | tagging VMs with the Flue id and finding them again |
-| `files:read`, `files:write` | the file-transfer API (reads, writes, stats) |
-| `secrets:read`, `secrets:write` | only with `initialSecrets` or `secrets` |
+| Scope | Operations | Used for |
+|---|---|---|
+| `vms:read` | `listVms`, `getVm` | finding a VM by tag, waiting for states, reading its tags |
+| `vms:write` | `createVm`, `startVm`, `resumeVm`, `wakeVm`, `deleteVm` | provisioning and `release` (`initial_tags` and `initial_secrets` ride on `createVm`) |
+| `vms:exec` | `execVm`, `execVmWithSecrets` | every command, and the exec fallbacks for files |
+| `tags:write` | `setVmTag` | only when Cove failed to apply a VM's initial tags (see below) |
+| `files:read` | `statVmFile`, `downloadVmFile` | reads and stats |
+| `files:write` | `uploadVmFile` | writes |
 
-A key without `files:*` still works: file content then moves over exec.
+`cove()` needs only `vms:exec` and `files:*`. A key without `files:read` or
+`files:write` still works: on the first 403 `scope_denied` the driver moves
+that direction (reads and stats, or writes) over exec and stops calling the
+API for it. `initialSecrets` additionally needs secrets enabled on the server.
 
 ## Quick example
 
@@ -105,7 +117,10 @@ useSandbox(cove(fromEnv(), "my-existing-vm", { cwd: "/workspace" }));
 
 `examples/repo-agent/` is a complete Flue project: an agent that clones a
 public repository into its VM, runs the tests and summarises them, plus the
-`release` script and a model-free smoke test.
+`release` script and a model-free smoke test. Its `smoke` and `release`
+scripts load `.env` the way `flue run` does; run `release` with the same
+`REPO_AGENT_TAGS` as the agent (or fewer), since the lookup matches every
+configured tag.
 
 ### Options
 
@@ -132,23 +147,31 @@ Flue never creates or destroys provider resources; the application does.
   creates one with those tags and waits for `running` (a VM that ends in
   `failed` is deleted and the call throws). So a conversation keeps its
   filesystem across messages and restarts.
+- Cove applies the tags only after the VM has been created, and only best
+  effort. Until then the VM cannot be found by tag. Once it is running, the
+  factory reads its tags and sets any that are missing (`tags:write`); if that
+  fails, it deletes the VM and throws.
 - Concurrent calls with the same id share one provisioning. Two *processes*
   racing on a brand-new id can still create two VMs; `release(id)` deletes
-  every VM carrying the id's tags, so neither leaks.
+  every VM carrying the id's tags, so neither leaks once both are tagged.
+- Because tags arrive late, `release(id)` (and `releaseAll()`) cannot see a VM
+  that is still being created, and a create whose response was lost leaves a
+  VM whose name nobody knows. Always set `expiry`: it is the backstop for
+  every VM the factory cannot find.
 - `release(id)` deletes the id's VMs and waits until Cove no longer lists them.
   It finds them by tag, so it works from a fresh process.
 - `releaseAll()` releases every id this factory instance provisioned or
   adopted. Build the factory once, outside the agent function, or it cannot
   know them: Flue re-renders the agent function many times.
 - `expiry` sets Cove's `ttl_policy`: Cove deletes the VM itself after that long,
-  whether or not anyone calls `release`.
+  whether or not anyone calls `release`. Recommended for every factory.
 - `cove()` never creates, starts, stops or deletes.
 
 ## How operations map onto Cove
 
 | Flue | Cove |
 |---|---|
-| `exec` | streaming `vms.exec`; `cwd`/`env` become a quoted `cd`/`export` prefix (env names are validated); `timeoutMs` → `timeout_secs = ceil(ms / 1000)` |
+| `exec` | streaming `vms.exec`; the command runs under `bash` when the guest has it, else `sh`; `cwd`/`env` become a quoted `cd`/`export` prefix (env names are validated); `timeoutMs` → `timeout_secs = ceil(ms / 1000)` |
 | `readFile`, `readFileBuffer` | file API `GET`; exec fallback (`base64`) |
 | `writeFile` | file API `PUT` (atomic in the guest); exec fallback (chunked `base64`, then `cat >` so symlinks are written through) |
 | `stat`, `exists` | file API `HEAD`; exec fallback (`stat -L`, `test -L`, `test -e`) |
@@ -158,10 +181,12 @@ The file API refuses some paths a shell can still serve, and those fall back
 to exec: a symlink anywhere in the path or a non-regular target (422
 `file_not_regular`), a path on the API's deny-list such as `/proc` (403
 `file_path_denied`), a guest agent that predates the API (409
-`guest_agent_too_old`), and a path the API's syntax rules reject (400). On
+`guest_agent_too_old`), a key without `files:read`/`files:write` (403
+`scope_denied`), and a path the API's syntax rules reject (400). On
 Ubuntu `/bin`, `/lib` and `/sbin` are symlinks, so paths under them always use
-the fallback. 404 is `ENOENT`; 413 `file_too_large` is an error, never a
-fallback. A VM that is not running or is gone becomes Flue's
+the fallback. 404 is `ENOENT`. 413 `file_too_large` is an error for
+`readFile`/`readFileBuffer`/`writeFile`; `stat` and `exists` fall back to exec
+on it, since a shell can still stat a file too big to transfer. A VM that is not running or is gone becomes Flue's
 `SandboxDiedError`, as does a `paused` event in the middle of an exec. 429
 (rate limit) and file-API 503 (`unavailable`) are retried with backoff.
 
@@ -178,6 +203,8 @@ are safe.
 
 These were measured against a Cove 0.33.2 server.
 
+- **Shell.** Commands run under `bash` when the guest has it (so `[[ ]]` and
+  `set -o pipefail` work), otherwise under `sh`.
 - **No streaming in Flue's contract.** `exec` resolves with the collected
   output; use `onOutput` to show it live.
 - **Timeouts.** Cove ends an expired `timeout_secs` with an error event
@@ -192,7 +219,10 @@ These were measured against a Cove 0.33.2 server.
   stream) and then kills the command's process group with a second exec. Flue
   rejects the caller with `AbortError` at once, as its contract requires; the
   kill lands a few hundred milliseconds later. Without `setsid` in the guest
-  only the top process is killed.
+  only the top process is killed. Residual window: the kill waits up to about
+  a second for the command to record its pid; a command that starts later
+  than that (the abort raced the request itself) is not killed. A recorded
+  pid that has since been reused by another process is left alone.
 - **Non-UTF-8 output.** If a command writes bytes that are not valid UTF-8,
   Cove drops that command's output (and the command may then die of
   `SIGPIPE`). The adapter's own transfers use base64, so file content is safe;
@@ -201,7 +231,8 @@ These were measured against a Cove 0.33.2 server.
   only. `mtime` is left out rather than invented; it is present when the
   exec fallback answers (directories, symlinks).
 - **Size cap.** The file API refuses files above the server's `[files]
-  max_bytes` (100 MiB by default) with 413. There is no exec fallback for that.
+  max_bytes` (100 MiB by default) with 413. Reads and writes of such a file
+  fail; there is no exec fallback for content (`stat`/`exists` still work).
 - **File-API writes** create files owned by root, keep an existing file's mode
   and use `0644` for a new one.
 - **Rate limit.** Cove limits each source address (30 requests/s by default).
@@ -217,7 +248,7 @@ These were measured against a Cove 0.33.2 server.
 |---|---|
 | `npm test` | Unit tests with no Cove server: quoting through a real `sh`, env-name validation, timeout rounding, every exec terminal event (`exit`, `error`, `paused`, timeout → 124), abort and timeout killing the process group, every file-API status and its fallback (a filesystem-backed fake with Cove's rules, plus the fetch client against a mock `fetch`), short bodies, 429/503 retries, id dedupe and reuse, release, and that the API key never leaks into errors or serialized objects |
 | `npm run test:integration` | Against a live Cove server (skipped without `COVE_API_URL` and a key): creates a VM through `coveVms`, runs every Sandbox operation through Flue's `sandboxFromDriver` (text, binary and multi-MiB files, symlinked paths, directories, quoted/dashed/newline paths, `/proc`, the timeout, abort, a non-zero exit, `cwd` and `env`, a VM paused mid-exec), checks reuse by id, and deletes the VM in `after` |
-| `cd examples/repo-agent && npm run smoke` | The example agent through Flue's real runtime (`start`, `init`, `dispatch`) on a real VM, with Pi's faux model provider replaying a scripted session of `bash`/`write`/`read` tool calls, then `release` |
+| `cd examples/repo-agent && npm run smoke` | The example agent through Flue's real runtime (`start`, `init`, `dispatch`) on a real VM, with Pi's faux model provider replaying a scripted session of `bash`/`write`/`read` tool calls, then `release`; also checks that the adapter's errors are `instanceof` the app's own `FlueError` |
 
 Tag test VMs so they are easy to find: the integration test tags its VM
 `flue-cove-test=1`, and the example takes extra tags from `REPO_AGENT_TAGS`.

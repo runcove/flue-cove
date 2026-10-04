@@ -2,16 +2,15 @@
  * Retrying calls that Cove refused with 429. The API rate-limits each source
  * address (a token bucket, 30 requests/s by default) and rejects the excess
  * before any handler runs, so a 429'd request did nothing and is safe to
- * resend, a POST included. `@cove/sdk` 0.4.0 does not expose `Retry-After`,
- * so the wait is a short exponential backoff with jitter (runcove-413g9).
+ * resend, a POST included. `@cove/sdk` 0.4.0 neither retries a 429 itself
+ * (its file methods included) nor exposes `Retry-After`, so the retry lives
+ * here and the wait is a short exponential backoff with jitter (runcove-413g9).
  */
 import { CoveAPIError } from "@cove/sdk";
 import { fileErrorStatus } from "./files.ts";
 
 export function isRateLimited(err: unknown): boolean {
-  return (
-    (err instanceof CoveAPIError && err.status === 429) || fileErrorStatus(err)?.status === 429
-  );
+  return err instanceof CoveAPIError && err.status === 429;
 }
 
 /**

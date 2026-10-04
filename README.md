@@ -20,7 +20,7 @@ It implements Flue's [Sandbox Adapter API](https://flueframework.com/docs/refere
 ## Install
 
 `@cove/sdk` is not on a public registry, so this repository vendors it
-(`vendor/cove-sdk-0.4.0.tgz`; see [vendor/README.md](vendor/README.md)).
+(`vendor/cove-sdk-0.4.0-cb09494.tgz`; see [vendor/README.md](vendor/README.md)).
 Install `flue-cove` from a clone or from a packed tarball, next to
 `@flue/runtime` (a peer dependency):
 
@@ -139,7 +139,8 @@ the adapter.
   `{ kind: "setup_tag", tag }`). Every `exec` then goes through
   `execWithSecrets`, which Cove buffers (no live output, no `onOutput`) and
   gives no server-side deadline; the adapter enforces `timeoutMs` itself;
-- `files`: a file-API client, or `false` to move all file content over exec.
+- `files`: a file-API client (default: the client's own `client.vms.files`),
+  or `false` to move all file content over exec.
 
 ## Lifecycle and cleanup
 
@@ -253,7 +254,7 @@ These were measured against a Cove 0.33.2 server.
 
 | Command | What it proves |
 |---|---|
-| `npm test` | Unit tests with no Cove server: quoting through a real `sh`, env-name validation, timeout rounding, every exec terminal event (`exit`, `error`, `paused`, timeout → 124), abort and timeout killing the process group, every file-API status and its fallback (a filesystem-backed fake with Cove's rules, plus the fetch client against a mock `fetch`), short bodies, 429/503 retries, id dedupe and reuse, release, and that the API key never leaks into errors or serialized objects |
+| `npm test` | Unit tests with no Cove server: quoting through a real `sh`, env-name validation, timeout rounding, every exec terminal event (`exit`, `error`, `paused`, timeout → 124), abort and timeout killing the process group, every file-API status and its fallback (a filesystem-backed fake with Cove's rules that throws the SDK's own errors), the SDK's file methods through a real `CoveClient` against a mock `fetch` (path encoding, error classes and codes, short bodies), 429/503 retries, id dedupe and reuse, release, and that the API key never leaks into errors or serialized objects |
 | `npm run test:integration` | Against a live Cove server (skipped without `COVE_API_URL` and a key): creates a VM through `coveVms`, runs every Sandbox operation through Flue's `sandboxFromDriver` (text, binary and multi-MiB files, symlinked paths, directories, quoted/dashed/newline paths, `/proc`, the timeout, abort, a non-zero exit, `cwd` and `env`, a VM paused mid-exec), checks reuse by id, and deletes the VM in `after` |
 | `cd examples/repo-agent && npm ci && npm run smoke` (after `npm ci` at the repository root) | The example agent through Flue's real runtime (`start`, `init`, `dispatch`) on a real VM, with Pi's faux model provider replaying a scripted session of `bash`/`write`/`read` tool calls, then `release`; also checks that the adapter's errors are `instanceof` the app's own `FlueError` |
 
@@ -278,14 +279,16 @@ npm run build          # tsc → dist/
 COVE_API_URL=https://<cove-host> COVE_API_KEY_FILE=~/.cove/api_key npm run test:integration
 ```
 
-`src/files.ts` is a stop-gap: `@cove/sdk` 0.4.0 has no file-transfer methods,
-so it carries a small fetch client for `HEAD`/`GET`/`PUT /api/vms/{name}/files`.
-Its `CoveFiles` interface (`stat`, `download`, `downloadBytes`, `upload`) and
-its error classes (`FileTooLargeError`, `FilePathDeniedError`,
+File transfer uses the SDK's `client.vms.files` (`stat`, `download`,
+`downloadBytes`, `upload`). `src/files.ts` wraps it in a small `CoveFiles`
+interface, so tests can hand the driver a fake, and re-exports the SDK's file
+error classes (`FileTooLargeError`, `FilePathDeniedError`,
 `VmFileNotFoundError`, `FileNotRegularError`, `UnavailableError`,
-`DownloadTruncatedError`) mirror the `client.vms.files` API the SDK is adding,
-and the driver classifies errors only through `fileErrorStatus`. When the SDK
-ships them, that one file becomes a thin wrapper and nothing else changes.
+`DownloadTruncatedError`). The driver classifies a failure only by its HTTP
+status and API `code` (`fileErrorStatus`), never by its message. A key
+without `files:read`/`files:write` is the SDK's plain `PermissionDeniedError`
+with code `scope_denied`; a `HEAD` error has no body, so `stat`'s 403 and 404
+carry no code. The SDK does not retry 429s; the driver does.
 
 ## License
 

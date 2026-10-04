@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { inspect } from "node:util";
 import { CoveClient } from "@cove/sdk";
-import { createCoveClient, filesFor, fromEnv } from "../src/client.ts";
+import { createCoveClient, fromEnv } from "../src/client.ts";
+import { filesFor } from "../src/files.ts";
 
 const KEY = "cvk_env_test_secret_value";
 const dir = mkdtempSync(join(tmpdir(), "flue-cove-env-"));
@@ -21,7 +22,7 @@ describe("fromEnv", () => {
     const client = fromEnv({ COVE_API_URL: "http://127.0.0.1:8091", COVE_API_KEY: KEY });
     assert.ok(client instanceof CoveClient);
     noKey(client);
-    assert.ok(filesFor(client), "a fromEnv client carries a file-API client");
+    assert.ok(filesFor(client), "a fromEnv client has the SDK's file API");
   });
 
   it("reads the key from COVE_API_KEY_FILE, trimming the trailing newline", async () => {
@@ -94,14 +95,17 @@ describe("fromEnv", () => {
 });
 
 describe("createCoveClient", () => {
-  it("registers a file-API client for the CoveClient it returns", () => {
+  it("returns a CoveClient with the SDK's file API", () => {
     const client = createCoveClient({ baseUrl: "https://cove.example.com", token: KEY });
+    assert.ok(client instanceof CoveClient);
     assert.ok(filesFor(client));
     noKey(client);
   });
 
-  it("a CoveClient built elsewhere has no file-API client", () => {
+  it("a CoveClient built elsewhere has the file API too", () => {
     const client = new CoveClient({ baseUrl: "https://cove.example.com", token: KEY });
-    assert.equal(filesFor(client), undefined);
+    const files = filesFor(client);
+    assert.ok(files);
+    noKey(files);
   });
 });

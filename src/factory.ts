@@ -18,9 +18,9 @@ import {
   type VmSummary,
 } from "@cove/sdk";
 import { type Sandbox, type SandboxFactory, sandboxFromDriver } from "@flue/runtime";
-import { createCoveClient, filesFor, fromEnv } from "./client.ts";
+import { createCoveClient, fromEnv } from "./client.ts";
 import { type CoveDriverOptions, type CoveExecClient, CoveSandboxDriver } from "./driver.ts";
-import type { CoveFiles } from "./files.ts";
+import { type CoveFiles, filesFor } from "./files.ts";
 import { withRateLimitRetry } from "./retry.ts";
 
 /** The part of `CoveClient` the provisioning factory uses. */
@@ -49,8 +49,8 @@ export interface CoveSandboxOptions extends Pick<CoveDriverOptions, "onOutput" |
   /** The sandbox's working directory, created with `mkdir -p` if missing. Default `/workspace`. */
   cwd?: string;
   /**
-   * The file-API client. Defaults to the one registered for a client built by
-   * `fromEnv()`/`createCoveClient()`. `false` moves all file content over exec.
+   * The file-API client. Defaults to the client's own `vms.files` (every
+   * `CoveClient` has one). `false` moves all file content over exec.
    */
   files?: CoveFiles | false;
 }
@@ -64,7 +64,7 @@ function isClientOptions(value: ClientInput): value is CoveClientOptions {
 function resolveFiles(client: object, files: CoveFiles | false | undefined): CoveFiles | undefined {
   if (files === false) return undefined;
   if (files) return files;
-  return filesFor(client as CoveClient);
+  return filesFor(client);
 }
 
 function driverOptions(files: CoveFiles | undefined, opts: CoveSandboxOptions): CoveDriverOptions {
@@ -81,8 +81,8 @@ async function sandboxOn(driver: CoveSandboxDriver, cwd: string): Promise<Sandbo
 }
 
 /**
- * A `SandboxFactory` over an existing VM. Pass a `CoveClient` (ideally one
- * from `fromEnv()`, which brings the file API with it) or client options.
+ * A `SandboxFactory` over an existing VM. Pass a `CoveClient` (for example
+ * from `fromEnv()`) or client options.
  * Every `createSandbox` call, whatever its id, targets `vmName`.
  */
 export function cove(

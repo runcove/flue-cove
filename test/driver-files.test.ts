@@ -13,20 +13,15 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, beforeEach, describe, it } from "node:test";
+import { CoveConnectionError } from "@cove/sdk";
 import {
   SandboxDiedError,
   SandboxOperationUnsupportedError,
   sandboxFromDriver,
 } from "@flue/runtime";
 import { CoveSandboxDriver } from "../src/driver.ts";
-import {
-  CoveFileError,
-  type CoveFiles,
-  DownloadTruncatedError,
-  FileNotRegularError,
-  VmFileNotFoundError,
-} from "../src/files.ts";
-import { localShellClient } from "./helpers.ts";
+import { type CoveFiles, DownloadTruncatedError, FileTooLargeError } from "../src/files.ts";
+import { apiError, localShellClient } from "./helpers.ts";
 
 const root = mkdtempSync(join(tmpdir(), "flue-cove-files-"));
 after(() => rmSync(root, { recursive: true, force: true }));
@@ -35,11 +30,13 @@ after(() => rmSync(root, { recursive: true, force: true }));
  * A CoveFiles fake served from the local filesystem with Cove's rules:
  * regular files only, a symlink anywhere in the path or a non-regular target
  * is 422 `file_not_regular`, a missing file or parent is 404, uploads keep an
- * existing file's mode. `override` forces an error for a method.
+ * existing file's mode. Errors are the SDK's own, built by its mapping: a GET
+ * or PUT error carries its code; a HEAD (`stat`) error has no body, so its 404
+ * has none. `override` forces an error for a method.
  */
-function fsFiles(override: Partial<Record<"stat" | "download" | "upload", CoveFileError>> = {}) {
+function fsFiles(override: Partial<Record<"stat" | "download" | "upload", Error>> = {}) {
   const used: string[] = [];
-  const check = (path: string, forWrite: boolean) => {
+  const check = (path: string, op: "stat" | "download" | "upload") => {
     const parts = path.split("/").filter(Boolean);
     let cur = "";
     for (const [i, part] of parts.entries()) {
@@ -48,14 +45,14 @@ function fsFiles(override: Partial<Record<"stat" | "download" | "upload", CoveFi
       try {
         st = lstatSync(cur);
       } catch {
-        if (forWrite && i === parts.length - 1) return;
-        throw new VmFileNotFoundError(404, "file_not_found", `file not found: ${cur}`);
+        if (op === "upload" && i === parts.length - 1) return;
+        throw op === "stat" ? apiError(404) : apiError(404, "file_not_found", `${cur} not found`);
       }
       if (st.isSymbolicLink()) {
-        throw new FileNotRegularError(422, "file_not_regular", `${cur} is a symbolic link`);
+        throw apiError(422, "file_not_regular", `${cur} is a symbolic link`);
       }
       if (i === parts.length - 1 && !st.isFile()) {
-        throw new FileNotRegularError(422, "file_not_regular", `${cur} is not a regular file`);
+        throw apiError(422, "file_not_regular", `${cur} is not a regular file`);
       }
     }
   };
@@ -63,24 +60,28 @@ function fsFiles(override: Partial<Record<"stat" | "download" | "upload", CoveFi
     async stat(_vm, path) {
       used.push(`stat ${path}`);
       if (override.stat) throw override.stat;
-      check(path, false);
+      check(path, "stat");
       const st = statSync(path);
       return { size: st.size, mode: st.mode & 0o777 };
     },
     async downloadBytes(_vm, path) {
       used.push(`download ${path}`);
       if (override.download) throw override.download;
-      check(path, false);
+      check(path, "download");
       return new Uint8Array(readFileSync(path));
     },
     async download(vm, path) {
       const bytes = await files.downloadBytes(vm, path);
-      return { size: bytes.length, body: new Blob([new Uint8Array(bytes)]).stream() };
+      return {
+        size: bytes.length,
+        mode: undefined,
+        body: new Blob([new Uint8Array(bytes)]).stream(),
+      };
     },
     async upload(_vm, path, bytes) {
       used.push(`upload ${path}`);
       if (override.upload) throw override.upload;
-      check(path, true);
+      check(path, "upload");
       writeFileSync(path, bytes);
       const st = statSync(path);
       return { path, size: st.size, mode: st.mode & 0o777, sha256: "" };
@@ -143,7 +144,7 @@ describe("readFile / readFileBuffer", () => {
     [400, "validation_failed"],
   ] as const) {
     it(`falls back to exec on ${status} ${code}`, async () => {
-      const { driver, calls } = setup({ download: new CoveFileError(status, code, "x") });
+      const { driver, calls } = setup({ download: apiError(status, code, "x") });
       writeFileSync(join(dir, "f"), "via exec");
       assert.equal(await driver.readFile(join(dir, "f")), "via exec");
       assert.equal(calls.length, 1);
@@ -162,7 +163,7 @@ describe("readFile / readFileBuffer", () => {
 
   it("a short body is a failed read, never partial content", async () => {
     const { driver, calls } = setup({
-      download: new DownloadTruncatedError(200, undefined, "received 3 of 10 bytes"),
+      download: new DownloadTruncatedError(10, 3),
     });
     writeFileSync(join(dir, "f"), "0123456789");
     await assert.rejects(driver.readFile(join(dir, "f")), /3 of 10 bytes/);
@@ -171,26 +172,26 @@ describe("readFile / readFileBuffer", () => {
 
   it("413 file_too_large is an error, not an exec fallback", async () => {
     const { driver, calls } = setup({
-      download: new CoveFileError(413, "file_too_large", "limit is 100 MiB"),
+      download: apiError(413, "file_too_large", "limit is 100 MiB"),
     });
     await assert.rejects(driver.readFile(join(dir, "f")), /100 MiB/);
     assert.equal(calls.length, 0);
   });
 
   it("503 unavailable surfaces", async () => {
-    const { driver } = setup({ download: new CoveFileError(503, "unavailable", "retry") });
+    const { driver } = setup({ download: apiError(503, "unavailable", "retry") });
     await assert.rejects(driver.readFile(join(dir, "f")), /retry/);
   });
 
   it("409 invalid_state_transition is SandboxDiedError", async () => {
     const { driver } = setup({
-      download: new CoveFileError(409, "invalid_state_transition", "not running"),
+      download: apiError(409, "invalid_state_transition", "not running"),
     });
     await assert.rejects(driver.readFile(join(dir, "f")), SandboxDiedError);
   });
 
   it("404 vm_not_found is SandboxDiedError", async () => {
-    const { driver } = setup({ download: new CoveFileError(404, "vm_not_found", "gone") });
+    const { driver } = setup({ download: apiError(404, "vm_not_found", "gone") });
     await assert.rejects(driver.readFile(join(dir, "f")), SandboxDiedError);
   });
 
@@ -249,29 +250,29 @@ describe("writeFile", () => {
   });
 
   it("writes an empty file through the exec fallback", async () => {
-    const { driver } = setup({ upload: new CoveFileError(422, "file_not_regular", "x") });
+    const { driver } = setup({ upload: apiError(422, "file_not_regular", "x") });
     await driver.writeFile(join(dir, "empty"), "");
     assert.equal(readFileSync(join(dir, "empty"), "utf8"), "");
   });
 
   it("413 is an error, not a fallback", async () => {
     const { driver, calls } = setup({
-      upload: new CoveFileError(413, "file_too_large", "too big"),
+      upload: apiError(413, "file_too_large", "too big"),
     });
     await assert.rejects(driver.writeFile(join(dir, "f"), "x"), /too big/);
     assert.equal(calls.length, 0);
   });
 
   it("507 guest_disk_full surfaces", async () => {
-    const { driver } = setup({ upload: new CoveFileError(507, "guest_disk_full", "disk full") });
+    const { driver } = setup({ upload: apiError(507, "guest_disk_full", "disk full") });
     await assert.rejects(driver.writeFile(join(dir, "f"), "x"), /disk full/);
   });
 
   for (const name of NASTY_NAMES) {
     it(`round-trips the awkward name ${JSON.stringify(name)} over exec`, async () => {
       const { driver } = setup({
-        upload: new CoveFileError(422, "file_not_regular", "x"),
-        download: new CoveFileError(422, "file_not_regular", "x"),
+        upload: apiError(422, "file_not_regular", "x"),
+        download: apiError(422, "file_not_regular", "x"),
       });
       await driver.writeFile(join(dir, name), `content of ${name}`);
       assert.equal(await driver.readFile(join(dir, name)), `content of ${name}`);
@@ -330,7 +331,7 @@ describe("stat", () => {
   });
 
   it("413 on HEAD (a big file) falls back to exec instead of failing", async () => {
-    const { driver } = setup({ stat: new CoveFileError(413, undefined, "too large") });
+    const { driver } = setup({ stat: apiError(413, "file_too_large") });
     writeFileSync(join(dir, "f"), "x");
     assert.equal((await driver.stat(join(dir, "f"))).size, 1);
   });
@@ -356,7 +357,7 @@ describe("exists", () => {
   });
 
   it("never throws: transport errors and dead VMs read as false", async () => {
-    const boom = new CoveFileError(0, undefined, "network down");
+    const boom = new CoveConnectionError("network down");
     const failing = new CoveSandboxDriver(
       {
         vms: {
@@ -490,7 +491,7 @@ describe("options the contract does not define", () => {
 describe("a key without files:* scopes (403 scope_denied)", () => {
   it("GET 403 scope_denied falls back to exec, and later reads skip the API", async () => {
     const { driver, used, calls } = setup({
-      download: new CoveFileError(403, "scope_denied", "key lacks files:read"),
+      download: apiError(403, "scope_denied", "key lacks files:read"),
     });
     writeFileSync(join(dir, "a"), "one");
     writeFileSync(join(dir, "b"), "two");
@@ -505,7 +506,7 @@ describe("a key without files:* scopes (403 scope_denied)", () => {
 
   it("PUT 403 scope_denied falls back to exec, and later writes skip the API", async () => {
     const { driver, used } = setup({
-      upload: new CoveFileError(403, "scope_denied", "key lacks files:write"),
+      upload: apiError(403, "scope_denied", "key lacks files:write"),
     });
     await driver.writeFile(join(dir, "w1"), "x");
     await driver.writeFile(join(dir, "w2"), "y");
@@ -514,5 +515,101 @@ describe("a key without files:* scopes (403 scope_denied)", () => {
     // Reads still use the API: files:read may be granted on its own.
     assert.equal(await driver.readFile(join(dir, "w1")), "x");
     assert.equal(used.filter((u) => u.startsWith("download")).length, 1);
+  });
+});
+
+describe("fallback rules, one per refusal", () => {
+  it("422 file_not_regular: read, write and stat all fall back to exec", async () => {
+    const err = apiError(422, "file_not_regular", "x");
+    const { driver, calls } = setup({ download: err, upload: err, stat: err });
+    await driver.writeFile(join(dir, "f"), "via exec");
+    assert.equal(await driver.readFile(join(dir, "f")), "via exec");
+    assert.equal((await driver.stat(join(dir, "f"))).size, 8);
+    assert.equal(await driver.exists(join(dir, "f")), true);
+    assert.equal(calls.length, 4);
+  });
+
+  it("403 file_path_denied: read and write fall back, and are tried again next time", async () => {
+    const err = apiError(403, "file_path_denied", "denied path");
+    const { driver, used } = setup({ download: err, upload: err });
+    await driver.writeFile(join(dir, "f"), "one");
+    await driver.writeFile(join(dir, "f"), "two");
+    assert.equal(await driver.readFile(join(dir, "f")), "two");
+    assert.equal(await driver.readFile(join(dir, "f")), "two");
+    // A denied path is about that path, not the key: no refusal memory.
+    assert.equal(used.filter((u) => u.startsWith("upload")).length, 2);
+    assert.equal(used.filter((u) => u.startsWith("download")).length, 2);
+  });
+
+  it("HEAD 403 (no code: denied path or missing scope) falls back without refusal memory", async () => {
+    const { driver, used } = setup({ stat: apiError(403) });
+    writeFileSync(join(dir, "f"), "abc");
+    assert.equal((await driver.stat(join(dir, "f"))).size, 3);
+    assert.equal(await driver.exists(join(dir, "f")), true);
+    assert.equal(used.filter((u) => u.startsWith("stat")).length, 2);
+    // Reads still use the API: a HEAD 403 cannot say the key lacks files:read.
+    assert.equal(await driver.readFile(join(dir, "f")), "abc");
+    assert.equal(used.filter((u) => u.startsWith("download")).length, 1);
+  });
+
+  it("403 scope_denied on a read: exists and stat skip the API from then on", async () => {
+    const { driver, used } = setup({ download: apiError(403, "scope_denied", "no files:read") });
+    writeFileSync(join(dir, "f"), "abc");
+    assert.equal(await driver.readFile(join(dir, "f")), "abc");
+    assert.equal(await driver.exists(join(dir, "f")), true);
+    assert.equal((await driver.stat(join(dir, "f"))).size, 3);
+    assert.deepEqual(used, [`download ${dir}/f`]);
+  });
+
+  it("refusal memory is per driver", async () => {
+    const shell = localShellClient();
+    const fake = fsFiles({ download: apiError(403, "scope_denied", "no files:read") });
+    const one = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+    const two = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+    writeFileSync(join(dir, "f"), "abc");
+    await one.readFile(join(dir, "f"));
+    await one.readFile(join(dir, "f"));
+    await two.readFile(join(dir, "f"));
+    assert.equal(fake.used.filter((u) => u.startsWith("download")).length, 2);
+  });
+
+  it("413: stat and exists fall back to exec, reads and writes fail", async () => {
+    const big = apiError(413, "file_too_large", "over the 100 MiB limit");
+    const { driver, calls } = setup({ stat: big, download: big, upload: big });
+    writeFileSync(join(dir, "f"), "12");
+    assert.equal((await driver.stat(join(dir, "f"))).size, 2);
+    assert.equal(await driver.exists(join(dir, "f")), true);
+    assert.equal(calls.length, 2);
+    await assert.rejects(driver.readFile(join(dir, "f")), FileTooLargeError);
+    await assert.rejects(driver.writeFile(join(dir, "f"), "x"), FileTooLargeError);
+    assert.equal(calls.length, 2, "no exec fallback for content");
+  });
+
+  it("HEAD 404 has no code, so it reads as a missing file even if the VM is gone", async () => {
+    // A HEAD error has no body: vm_not_found and file_not_found are both a bare 404.
+    const { driver, calls } = setup({ stat: apiError(404) });
+    await assert.rejects(driver.stat(join(dir, "f")), (err: unknown) => {
+      assert.equal((err as { code?: string }).code, "ENOENT");
+      assert.ok(!(err instanceof SandboxDiedError));
+      return true;
+    });
+    assert.equal(await driver.exists(join(dir, "f")), false);
+    assert.equal(calls.length, 0);
+  });
+
+  it("a short body is a failed read: not retried, no exec fallback", async () => {
+    let n = 0;
+    const shell = localShellClient();
+    const files: CoveFiles = {
+      ...fsFiles().files,
+      downloadBytes: async () => {
+        n++;
+        throw new DownloadTruncatedError(10, 3);
+      },
+    };
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files });
+    await assert.rejects(driver.readFileBuffer(join(dir, "f")), DownloadTruncatedError);
+    assert.equal(n, 1);
+    assert.equal(shell.calls.length, 0);
   });
 });

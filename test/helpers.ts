@@ -11,7 +11,13 @@
  * - an aborted request does not kill the guest command.
  */
 import { spawn } from "node:child_process";
-import type { ExecEvent, ExecOptions, ExecOutputDto, ExecWithSecretsOptions } from "@cove/sdk";
+import {
+  CoveAPIError,
+  type ExecEvent,
+  type ExecOptions,
+  type ExecOutputDto,
+  type ExecWithSecretsOptions,
+} from "@cove/sdk";
 import type { CoveExecClient } from "../src/driver.ts";
 
 export interface ExecCall {
@@ -177,4 +183,13 @@ export function scriptedClient(
     },
   };
   return { client, calls };
+}
+
+/**
+ * The error `@cove/sdk` throws for an HTTP refusal, built by the SDK's own
+ * mapping (`CoveAPIError.fromResponse`): `code` set means a JSON error body
+ * (GET/PUT); omitted, a body-less HEAD answer, as `stat` sees it.
+ */
+export function apiError(status: number, code?: string, message = code ?? "refused"): CoveAPIError {
+  return CoveAPIError.fromResponse(status, code === undefined ? undefined : { code, message });
 }

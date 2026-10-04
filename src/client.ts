@@ -1,34 +1,14 @@
 /**
- * Building a `CoveClient`, and remembering which file-API client goes with it.
- *
- * `@cove/sdk` keeps a client's base URL and credential private, so the
- * stop-gap file client (`files.ts`) cannot be derived from an arbitrary
- * `CoveClient`. Clients built here are registered with a matching file client
- * in a WeakMap; `filesFor(client)` finds it. A `CoveClient` constructed
- * elsewhere has none, and the driver then moves file content over exec.
+ * Building a `CoveClient` from options or from the environment. Every
+ * `CoveClient` carries the file API as `client.vms.files`; `filesFor` in
+ * `files.ts` adapts it for the driver.
  */
 import { readFileSync } from "node:fs";
 import { CoveClient, type CoveClientOptions } from "@cove/sdk";
-import { type CoveFiles, createFetchFiles } from "./files.ts";
 
-const registry = new WeakMap<CoveClient, CoveFiles>();
-
-/** The file-API client registered for `client`, if it was built by this package. */
-export function filesFor(client: CoveClient): CoveFiles | undefined {
-  return registry.get(client);
-}
-
-/** `new CoveClient(options)`, plus a file-API client with the same URL and credential. */
+/** `new CoveClient(options)`. */
 export function createCoveClient(options: CoveClientOptions): CoveClient {
-  const client = new CoveClient(options);
-  const filesOpts: Parameters<typeof createFetchFiles>[0] = { baseUrl: options.baseUrl };
-  if (options.auth) filesOpts.auth = options.auth;
-  if (options.token) filesOpts.token = options.token;
-  if (options.ticket) filesOpts.ticket = options.ticket;
-  if (options.fetch) filesOpts.fetch = options.fetch;
-  if (options.allowInsecureHttp) filesOpts.allowInsecureHttp = true;
-  registry.set(client, createFetchFiles(filesOpts));
-  return client;
+  return new CoveClient(options);
 }
 
 /** Extra client options for {@link fromEnv}; the URL and key always come from the environment. */

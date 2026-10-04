@@ -21,8 +21,9 @@ import {
   fauxText,
   fauxToolCall,
 } from "@earendil-works/pi-ai";
-import { init } from "@flue/runtime";
+import { FlueError, init, SandboxDiedError, SandboxOperationUnsupportedError } from "@flue/runtime";
 import { start } from "@flue/runtime/node";
+import { CoveSandboxDriver } from "flue-cove";
 import { RepoAgent } from "./src/agents/repo-agent.ts";
 import { repoVms } from "./src/sandbox.ts";
 
@@ -103,6 +104,32 @@ try {
   assert.match(summary, /Test command:/);
   assert.match(reply.text ?? "", /passed|did not pass/);
   assert.equal(faux.getPendingResponseCount(), 0, "the scripted session ran to the end");
+
+  // Flue classifies sandbox errors with instanceof, so the adapter must throw
+  // classes from THIS app's @flue/runtime, not from a second copy (which a
+  // symlinked install of flue-cove would load).
+  const unsupported = await sandbox
+    .rm("nothing-here", { recursive: true, maxRetries: 3 } as { recursive: boolean })
+    .catch((e: unknown) => e);
+  assert.ok(unsupported instanceof SandboxOperationUnsupportedError, String(unsupported));
+  assert.ok(unsupported instanceof FlueError);
+  const dying = new CoveSandboxDriver(
+    {
+      vms: {
+        async *exec() {
+          yield { kind: "paused" as const, reason: "test", newState: "Pausing" };
+        },
+        async execWithSecrets() {
+          throw new Error("unused");
+        },
+      },
+    },
+    "no-vm",
+  );
+  const died = await dying.exec("true").catch((e: unknown) => e);
+  assert.ok(died instanceof SandboxDiedError, String(died));
+  assert.ok(died instanceof FlueError);
+  console.log("adapter errors are instanceof this app's FlueError: OK");
   console.log("--- SUMMARY.md in the VM ---");
   console.log(summary);
   console.log("smoke: OK");

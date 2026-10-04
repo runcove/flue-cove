@@ -9,8 +9,8 @@
   },
   "scripts": {
     "agent": "flue run src/agents/repo-agent.ts",
-    "smoke": "node smoke.ts",
-    "release": "node src/release.ts",
+    "smoke": "node --env-file-if-exists=.env smoke.ts",
+    "release": "node --env-file-if-exists=.env src/release.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

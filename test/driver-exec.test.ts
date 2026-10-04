@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -164,7 +164,9 @@ describe("exec: timeout", () => {
     assert.match(res.stderr, /timed out after 1s/);
   });
 
-  it("kills the whole process group, not just the direct child", async () => {
+  it("kills the whole process group, not just the direct child", {
+    skip: process.platform !== "linux" && "needs setsid",
+  }, async () => {
     const marker = join(dir, "timeout-marker");
     const { client } = localShellClient();
     const driver = new CoveSandboxDriver(client, "vm");
@@ -223,7 +225,9 @@ describe("exec: secrets", () => {
     assert.equal(calls.length, 1);
   });
 
-  it("enforces timeoutMs itself (the route has none): 124 and the group is killed", async () => {
+  it("enforces timeoutMs itself (the route has none): 124 and the group is killed", {
+    skip: process.platform !== "linux" && "needs setsid",
+  }, async () => {
     const marker = join(dir, "secrets-marker");
     const { client } = localShellClient();
     const driver = new CoveSandboxDriver(client, "vm", { secrets: { kind: "all" } });
@@ -260,7 +264,28 @@ describe("exec: shell", () => {
   });
 });
 
-describe("the group-kill helper", () => {
+const LINUX = process.platform === "linux";
+
+/** True when `pid` has exited (ENOENT) or is a zombie awaiting its reaper. */
+function goneOrZombie(pid: number): boolean {
+  try {
+    return readFileSync(`/proc/${pid}/stat`, "utf8")
+      .replace(/^.*\) /, "")
+      .startsWith("Z");
+  } catch {
+    return true;
+  }
+}
+
+function killQuietly(pid: number | undefined): void {
+  try {
+    if (pid) process.kill(pid, "SIGKILL");
+  } catch {
+    // already gone
+  }
+}
+
+describe("the group-kill helper", { skip: !LINUX && "needs /proc and setsid" }, () => {
   const run = (script: string, ...args: string[]) =>
     new Promise<number>((resolve) => {
       const child = spawn("sh", ["-c", script, "sh", ...args], { stdio: "ignore" });
@@ -270,66 +295,72 @@ describe("the group-kill helper", () => {
     readFileSync(`/proc/${pid}/stat`, "utf8")
       .replace(/^.*\) /, "")
       .split(" ")[19];
-  const alive = (pid: number) => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
 
   it("kills a recorded group even after its leader is gone", async () => {
     const pidFile = join(dir, "g.pid");
+    const memberFile = join(dir, "g.member");
     // A new session whose leader exits at once, leaving a member running.
     const leader = spawn(
       "setsid",
-      ["sh", "-c", `echo "g $$ x" > '${pidFile}'; sleep 30 & exit 0`],
-      {
-        stdio: "ignore",
-      },
+      ["sh", "-c", `sleep 30 & echo $! > '${memberFile}'; echo "g $$ x" > '${pidFile}'; exit 0`],
+      { stdio: "ignore" },
     );
     await new Promise((r) => leader.on("close", r));
-    const pgid = Number(readFileSync(pidFile, "utf8").split(" ")[1]);
-    assert.equal(await run(KILL_GROUP, pidFile), 0);
-    await sleep(200);
-    const out = execFileSync("ps", ["-eo", "pgid="], { encoding: "utf8" });
-    assert.ok(!out.split("\n").some((l) => Number(l.trim()) === pgid), "group survived");
+    const member = Number(readFileSync(memberFile, "utf8").trim());
+    try {
+      assert.equal(goneOrZombie(member), false, "the member should be running before the kill");
+      assert.equal(await run(KILL_GROUP, pidFile), 0);
+      await sleep(200);
+      assert.equal(goneOrZombie(member), true, "the group survived");
+    } finally {
+      killQuietly(member);
+    }
   });
 
   it("does not kill a single pid whose start time no longer matches (pid reuse)", async () => {
     const pidFile = join(dir, "p.pid");
     const victim = spawn("sleep", ["30"], { stdio: "ignore" });
-    writeFileSync(pidFile, `p ${victim.pid} 1`);
-    await run(KILL_GROUP, pidFile);
-    await sleep(100);
-    assert.equal(alive(victim.pid as number), true);
-    victim.kill();
+    try {
+      writeFileSync(pidFile, `p ${victim.pid} 1`);
+      await run(KILL_GROUP, pidFile);
+      await sleep(100);
+      assert.equal(goneOrZombie(victim.pid as number), false);
+    } finally {
+      killQuietly(victim.pid);
+    }
   });
 
   it("kills a single pid whose start time matches", async () => {
     const pidFile = join(dir, "p2.pid");
     const victim = spawn("sleep", ["30"], { stdio: "ignore" });
     const closed = new Promise((r) => victim.on("close", r));
-    await sleep(50);
-    writeFileSync(pidFile, `p ${victim.pid} ${starttime(victim.pid as number)}`);
-    await run(KILL_GROUP, pidFile);
-    await closed;
-    assert.equal(alive(victim.pid as number), false);
+    try {
+      await sleep(50);
+      writeFileSync(pidFile, `p ${victim.pid} ${starttime(victim.pid as number)}`);
+      await run(KILL_GROUP, pidFile);
+      await closed;
+      assert.equal(goneOrZombie(victim.pid as number), true);
+    } finally {
+      killQuietly(victim.pid);
+    }
   });
 
   it("waits briefly for a pid file that does not exist yet", async () => {
     const pidFile = join(dir, "late.pid");
     const victim = spawn("sleep", ["30"], { stdio: "ignore" });
     const closed = new Promise((r) => victim.on("close", r));
-    await sleep(50);
-    setTimeout(
-      () => writeFileSync(pidFile, `p ${victim.pid} ${starttime(victim.pid as number)}`),
-      300,
-    );
-    await run(KILL_GROUP, pidFile);
-    await closed;
-    assert.equal(alive(victim.pid as number), false);
+    try {
+      await sleep(50);
+      setTimeout(
+        () => writeFileSync(pidFile, `p ${victim.pid} ${starttime(victim.pid as number)}`),
+        300,
+      );
+      await run(KILL_GROUP, pidFile);
+      await closed;
+      assert.equal(goneOrZombie(victim.pid as number), true);
+    } finally {
+      killQuietly(victim.pid);
+    }
   });
 
   it("ignores garbage in the pid file", async () => {

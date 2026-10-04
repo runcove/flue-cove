@@ -34,8 +34,8 @@ cd flue-cove && npm ci && npm run build
 cd ../my-flue-app && npm install --install-links ../flue-cove @flue/runtime@2.2.2
 
 # or from a tarball (the SDK is bundled inside it)
-cd flue-cove && npm pack            # → flue-cove-0.1.0.tgz
-cd ../my-flue-app && npm install ../flue-cove/flue-cove-0.1.0.tgz @flue/runtime@2.2.2
+cd flue-cove && npm pack            # → flue-cove-0.2.0.tgz
+cd ../my-flue-app && npm install ../flue-cove/flue-cove-0.2.0.tgz @flue/runtime@2.2.2
 ```
 
 Install a *copy*, never a symlink: a plain `npm install ../flue-cove` links
@@ -320,6 +320,8 @@ status and API `code` (`fileErrorStatus`), never by its message. A key
 without `files:read`/`files:write` is the SDK's plain `PermissionDeniedError`
 with code `scope_denied`; a `HEAD` error has no body, so `stat`'s 403 and 404
 carry no code. The SDK does not retry 429s; the driver does.
+
+Changes, including breaking ones, are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

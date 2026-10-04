@@ -1,6 +1,6 @@
 {
   "name": "flue-cove",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Flue sandbox adapter backed by Cove microVMs",
   "type": "module",

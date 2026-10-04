@@ -220,8 +220,11 @@ is missing on a `GET` or `PUT` (`vm_not_found` or `file_not_found`), so a
 codeless 404 there means "no route". A `HEAD` error never has a body, so the
 first bare `HEAD` 404 is checked once per driver with a probe: `HEAD` of the
 path `/`, which the route refuses with 400 before touching the guest and an
-old server answers with the same bare 404. Once the route is known to be
-missing, every file operation runs over exec. `CoveSandboxDriver.fileRoute`
+old server answers with the same bare 404. Only those two answers are
+recorded. Anything else (no answer, a 429 or 5xx after the retries, a 401 or
+403 from the auth gate) decides nothing, and the next bare `HEAD` 404 probes
+again. Once the route is known to be missing, every file operation runs over
+exec. `CoveSandboxDriver.fileRoute`
 reports what the driver found.
 
 Every option Flue defines (`exec`'s `cwd`, `env`, `timeoutMs`, `signal`;

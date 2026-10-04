@@ -862,3 +862,109 @@ describe("a client-wide timeoutMs and file transfers", () => {
     assert.equal(await driver.readFile("/f"), "hi");
   });
 });
+
+describe("the route probe records only what proves the route", () => {
+  /**
+   * A server WITHOUT the file API (every /files request a bare 404), except
+   * that the probe of `/` gets `probe()` instead: an answer that says
+   * nothing about the route.
+   */
+  function apiLess(probe: () => Error) {
+    const used: string[] = [];
+    const files: CoveFiles = {
+      stat: async (_vm, path) => {
+        used.push(`stat ${path}`);
+        throw path === "/" ? probe() : apiError(404);
+      },
+      download: async () => {
+        throw apiError(404);
+      },
+      downloadBytes: async () => {
+        throw apiError(404);
+      },
+      upload: async () => {
+        throw apiError(404);
+      },
+    };
+    const shell = localShellClient();
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files });
+    return { driver, used };
+  }
+
+  for (const [label, make] of [
+    ["no HTTP answer", () => new CoveConnectionError("connection reset")],
+    ["a 429 that outlasts the retries", () => apiError(429)],
+    ["a proxy 502", () => apiError(502)],
+    ["a 503 that outlasts the retries", () => apiError(503)],
+    ["a 401", () => apiError(401, "credential_invalid")],
+    ["a 403 scope_denied", () => apiError(403, "scope_denied")],
+  ] as const) {
+    it(`${label}: not cached, probed again next time`, async () => {
+      const { driver, used } = apiLess(make);
+      const probes = () => used.filter((u) => u === "stat /").length;
+      await assert.rejects(driver.stat(join(dir, "nope")), { code: "ENOENT" });
+      assert.equal(driver.fileRoute, "unknown");
+      // A 429 or 503 is retried inside one probe, so count rounds, not calls.
+      const perProbe = probes();
+      assert.ok(perProbe >= 1);
+      await assert.rejects(driver.stat(join(dir, "nope")), { code: "ENOENT" });
+      assert.equal(probes(), 2 * perProbe, "probed again");
+      assert.equal(driver.fileRoute, "unknown");
+    });
+  }
+
+  it("once the probe gets its answer, stat on an API-less server ends correctly over exec", async () => {
+    let flaky = true;
+    const { driver } = apiLess(() => (flaky ? apiError(503) : apiError(404)));
+    writeFileSync(join(dir, "f"), "abc");
+    // The probe is inconclusive: the HEAD 404 stands as ENOENT this time.
+    await assert.rejects(driver.stat(join(dir, "f")), { code: "ENOENT" });
+    flaky = false;
+    // Probed again: a bare 404 for `/` too, so the route is absent and the shell answers.
+    assert.equal((await driver.stat(join(dir, "f"))).size, 3);
+    assert.equal(driver.fileRoute, "absent");
+  });
+
+  it("only a 400 for `/` records the route as present", async () => {
+    const { driver } = apiLess(() => apiError(400, "validation_failed"));
+    await assert.rejects(driver.stat(join(dir, "nope")), { code: "ENOENT" });
+    assert.equal(driver.fileRoute, "present");
+  });
+});
+
+describe("GET/PUT answers that mark the route present", () => {
+  function refusing(err: Error) {
+    const fake = fsFiles({ download: err, upload: err });
+    const shell = localShellClient();
+    return new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+  }
+
+  for (const [status, code] of [
+    [401, "credential_invalid"],
+    [403, "scope_denied"],
+    [404, "vm_not_found"],
+    [503, "unavailable"],
+    [409, "guest_agent_too_old"],
+  ] as const) {
+    it(`${status} ${code} leaves fileRoute unknown`, async () => {
+      const driver = refusing(apiError(status, code));
+      writeFileSync(join(dir, "f"), "x");
+      await driver.readFile(join(dir, "f")).catch(() => undefined);
+      assert.equal(driver.fileRoute, "unknown");
+    });
+  }
+
+  for (const [status, code] of [
+    [404, "file_not_found"],
+    [422, "file_not_regular"],
+    [403, "file_path_denied"],
+    [413, "file_too_large"],
+  ] as const) {
+    it(`${status} ${code}, which only the files handler sends, marks it present`, async () => {
+      const driver = refusing(apiError(status, code));
+      writeFileSync(join(dir, "f"), "x");
+      await driver.readFile(join(dir, "f")).catch(() => undefined);
+      assert.equal(driver.fileRoute, "present");
+    });
+  }
+});

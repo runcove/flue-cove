@@ -524,9 +524,17 @@ export class CoveSandboxDriver implements SandboxDriver {
         await withRateLimitRetry(() => files.stat(this.#vm, "/"), FILE_RETRY);
         return "present" as const;
       } catch (err) {
+        // Only the two answers that settle it are recorded. With the route,
+        // `admit()` refuses `/` (an empty component) with 400 once the VM is
+        // found, before any guest call, so no 409 can come first. Without it,
+        // the router's bare 404. Anything else (no answer, a 429 or 503 past
+        // the retries, a proxy's 5xx, a 401, a 403 from the scope gate in
+        // front of every route) says nothing about the route: probe again
+        // next time.
         const http = apiErrorStatus(err);
-        if (!http) return "unknown" as const;
-        return http.status === 404 && http.code === undefined ? "absent" : "present";
+        if (http?.status === 400) return "present" as const;
+        if (http?.status === 404 && http.code === undefined) return "absent" as const;
+        return "unknown" as const;
       }
     })();
     const found = await this.#routeProbe;
@@ -550,8 +558,10 @@ export class CoveSandboxDriver implements SandboxDriver {
       if (op !== "upload" && isPlainCoveError(err)) return;
       throw err;
     }
-    // Only the file route's own handlers send a code.
-    if (http.code !== undefined) this.#routeSeen();
+    // Only the file route's own handlers send these codes. Not 401 or
+    // `scope_denied` (the auth gate in front of every route), not
+    // `vm_not_found` or `unavailable` (other handlers send them too).
+    if (http.code !== undefined && FILE_ROUTE_CODES.has(http.code)) this.#routeSeen();
     // A GET or PUT 404 from a server with the file route always names what is
     // missing (`vm_not_found` or `file_not_found`); one with no code is the
     // router of a server that predates the route. Use exec from now on.
@@ -731,6 +741,14 @@ export class CoveSandboxDriver implements SandboxDriver {
     await this.#must("rm", path, flags ? ["rm", `-${flags}`, "--", path] : ["rm", "--", path]);
   }
 }
+
+/** Error codes only the file-transfer handlers send: an answer with one proves the route. */
+const FILE_ROUTE_CODES = new Set([
+  "file_not_found",
+  "file_not_regular",
+  "file_path_denied",
+  "file_too_large",
+]);
 
 /** A 404 with no code: what a HEAD error (no body) or a missing route answers. */
 function isBare404(err: unknown): boolean {

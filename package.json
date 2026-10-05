@@ -1,6 +1,6 @@
 {
   "name": "flue-cove",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Flue sandbox adapter backed by Cove microVMs",
   "type": "module",
@@ -27,13 +27,14 @@
     "test": "node --test --test-reporter=spec --test-timeout=60000 \"test/*.test.ts\"",
     "test:integration": "node --test --test-reporter=spec --test-concurrency=1 \"test/integration/*.test.ts\"",
     "check:vendor": "node scripts/check-vendor.mjs",
+    "update:cove-sdk": "node scripts/update-cove-sdk.ts",
     "prepare": "npm run build"
   },
   "peerDependencies": {
     "@flue/runtime": "^2.2.2"
   },
   "dependencies": {
-    "@cove/sdk": "file:vendor/cove-sdk-0.4.0-cb09494.tgz"
+    "@cove/sdk": "file:vendor/cove-sdk-0.4.0-bde79e4.tgz"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",

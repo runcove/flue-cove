@@ -7,7 +7,13 @@
  * - `fromEnv()`: a `CoveClient` from `COVE_API_URL` + `COVE_API_KEY`/`COVE_API_KEY_FILE`.
  */
 /** The bundled SDK's client, so an application can build one from the same copy. */
-export { CoveClient, type CoveClientOptions } from "@cove/sdk";
+export {
+  CoveClient,
+  type CoveClientOptions,
+  CoveConfigError,
+  CoveConnectionError,
+  CoveTimeoutError,
+} from "@cove/sdk";
 export { createCoveClient, type FromEnvOptions, fromEnv } from "./client.ts";
 export {
   type CoveDriverOptions,
@@ -16,7 +22,7 @@ export {
   type OutputStream,
   timeoutSecsFor,
 } from "./driver.ts";
-export { apiErrorStatus } from "./errors.ts";
+export { apiErrorStatus, isDeadline, retryAfterSecs } from "./errors.ts";
 export {
   type CoveProvisioningClient,
   type CoveSandboxOptions,

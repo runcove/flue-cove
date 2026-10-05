@@ -26,10 +26,14 @@ export {
   VmFileNotFoundError,
 } from "@cove/sdk";
 
-/** `stat`: what a HEAD tells us about a regular file. Cove sends no modification time. */
+/**
+ * `stat`: what a HEAD tells us about a regular file: its size, mode and
+ * modification time (`mtime`, from `Last-Modified`; `undefined` from a server
+ * that predates it).
+ */
 export type CoveFileInfo = VmFileStat;
 
-/** `download`: the file's size and mode, and its bytes as a stream. */
+/** `download`: the file's size, mode and modification time, and its bytes as a stream. */
 export type CoveFileDownload = VmFileDownload;
 
 /** The server's answer to a committed upload. */
@@ -124,11 +128,13 @@ export function filesFor(client: Pick<CoveClient, "vms"> | object): CoveFiles | 
  * `FileTooLargeError`, `UnavailableError`) and the plain status classes for
  * the rest, such as a key without `files:read`/`files:write`, which is a
  * `PermissionDeniedError` with `code` `scope_denied`. HEAD responses carry no
- * body, so for `stat` only the status is known, except where the status
- * implies its code (413, 422, 503): a 404 may be a missing VM (`vm_not_found`)
- * or a missing file, and a 403 or 409 cannot be told apart from their other
- * causes (runcove-1cl10). Those have no `code`, and the driver treats them
- * accordingly.
+ * body: a current server names the code in `X-Cove-Error-Code`, which the SDK
+ * reads, so `stat` errors carry codes like any other. From a server that
+ * predates that header only the status is known, except where the status
+ * implies its code (413, 422, 503): a 404 may then be a missing VM
+ * (`vm_not_found`) or a missing file, and a 403 or 409 cannot be told apart
+ * from their other causes (runcove-1cl10). Those have no `code`, and the
+ * driver treats them accordingly.
  */
 export function fileErrorStatus(
   err: unknown,

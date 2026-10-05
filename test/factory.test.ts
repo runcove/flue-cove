@@ -142,8 +142,13 @@ function fakeCove(
 }
 
 const noFiles: CoveFiles = {
-  stat: async () => ({ size: 0, mode: undefined }),
-  download: async () => ({ size: 0, mode: undefined, body: new Blob([]).stream() }),
+  stat: async () => ({ size: 0, mode: undefined, mtime: undefined }),
+  download: async () => ({
+    size: 0,
+    mode: undefined,
+    mtime: undefined,
+    body: new Blob([]).stream(),
+  }),
   downloadBytes: async () => new Uint8Array(),
   upload: async (_vm, path) => ({ path, size: 0, mode: 0o644, sha256: "" }),
 };

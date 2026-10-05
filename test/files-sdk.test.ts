@@ -9,10 +9,12 @@ import { inspect } from "node:util";
 import {
   CoveClient,
   CoveConnectionError,
+  CoveTimeoutError,
   NotFoundError,
   PermissionDeniedError,
   RateLimitError,
 } from "@cove/sdk";
+import { isDeadline, retryAfterSecs } from "../src/errors.ts";
 import {
   DownloadTruncatedError,
   FileNotRegularError,
@@ -91,7 +93,7 @@ describe("filesFor / sdkFiles: the wire", () => {
   it("HEADs the files route, percent-encoding a space as %20 and a plus as %2B", async () => {
     const { files, seen } = client(() => ok(null, 12, "0755"));
     const info = await files.stat("my-vm", "/root/a b+c/ü's.txt");
-    assert.deepEqual(info, { size: 12, mode: 0o755 });
+    assert.deepEqual(info, { size: 12, mode: 0o755, mtime: undefined });
     const req = seen[0];
     assert.ok(req);
     assert.equal(req.method, "HEAD");
@@ -170,13 +172,18 @@ describe("filesFor / sdkFiles: the wire", () => {
     const files = sdkFiles({
       stat: async (n, p) => {
         calls.push(`stat ${n} ${p}`);
-        return { size: 1, mode: undefined };
+        return { size: 1, mode: undefined, mtime: undefined };
       },
-      download: async () => ({ size: 0, mode: undefined, body: new Blob([]).stream() }),
+      download: async () => ({
+        size: 0,
+        mode: undefined,
+        mtime: undefined,
+        body: new Blob([]).stream(),
+      }),
       downloadBytes: async () => new Uint8Array(),
       upload: async (_n, p) => ({ path: p, size: 0, mode: 0o644, sha256: "" }),
     });
-    assert.deepEqual(await files.stat("vm", "/a"), { size: 1, mode: undefined });
+    assert.deepEqual(await files.stat("vm", "/a"), { size: 1, mode: undefined, mtime: undefined });
     assert.deepEqual(calls, ["stat vm /a"]);
   });
 });
@@ -240,7 +247,40 @@ describe("SDK errors as the driver sees them (fileErrorStatus)", () => {
     });
   }
 
-  it("a HEAD 404 cannot say whether the file or the VM is missing", async () => {
+  // A current server names a HEAD error's code in X-Cove-Error-Code.
+  for (const [status, code, cls] of [
+    [403, "file_path_denied", FilePathDeniedError],
+    [403, "scope_denied", PermissionDeniedError],
+    [404, "file_not_found", VmFileNotFoundError],
+    [404, "vm_not_found", NotFoundError],
+    [409, "invalid_state_transition", Error],
+    [409, "guest_agent_too_old", Error],
+  ] as const) {
+    it(`HEAD ${status} with X-Cove-Error-Code ${code} → ${cls.name}, code ${code}`, async () => {
+      const { files } = client(
+        () => new Response(null, { status, headers: { "x-cove-error-code": code } }),
+      );
+      await assert.rejects(files.stat("vm", "/f"), (err: unknown) => {
+        assert.ok(err instanceof cls, `got ${String(err)}`);
+        assert.deepEqual(fileErrorStatus(err), { status, code });
+        return true;
+      });
+    });
+  }
+
+  it("stat reads Last-Modified as mtime", async () => {
+    const { files } = client(
+      () =>
+        new Response(null, {
+          status: 200,
+          headers: { "content-length": "3", "last-modified": "Mon, 05 Oct 2026 08:00:00 GMT" },
+        }),
+    );
+    const info = await files.stat("vm", "/f");
+    assert.equal(info.mtime?.toISOString(), "2026-10-05T08:00:00.000Z");
+  });
+
+  it("a HEAD 404 without X-Cove-Error-Code cannot say whether the file or the VM is missing", async () => {
     const { files } = client(() => new Response(null, { status: 404 }));
     await assert.rejects(files.stat("vm", "/f"), (err: unknown) => {
       assert.ok(!(err instanceof VmFileNotFoundError));
@@ -295,6 +335,40 @@ describe("SDK errors as the driver sees them (fileErrorStatus)", () => {
   it("fileErrorStatus ignores anything that is not an API error", () => {
     assert.equal(fileErrorStatus(new Error("x")), undefined);
     assert.equal(fileErrorStatus("x"), undefined);
+  });
+
+  it("a 429's Retry-After reaches retryAfterSecs", async () => {
+    const { files } = client(
+      () => new Response(null, { status: 429, headers: { "retry-after": "2" } }),
+    );
+    await assert.rejects(files.stat("vm", "/f"), (err: unknown) => {
+      assert.ok(err instanceof RateLimitError);
+      assert.equal(retryAfterSecs(err), 2);
+      return true;
+    });
+  });
+
+  it("the SDK's own deadline is a CoveTimeoutError, which isDeadline recognises", async () => {
+    const { files } = client(
+      (req) =>
+        new Promise<Response>((_resolve, reject) => {
+          req.signal?.addEventListener("abort", () => reject(req.signal?.reason), { once: true });
+        }),
+    );
+    // The SDK's deadline timer is unref'd, and the mock fetch holds nothing
+    // open: keep the event loop alive until the deadline fires.
+    const keepAlive = setInterval(() => {}, 1000);
+    try {
+      await assert.rejects(files.stat("vm", "/f", { timeoutMs: 20 }), (err: unknown) => {
+        assert.ok(err instanceof CoveTimeoutError, `got ${String(err)}`);
+        assert.ok(err instanceof CoveConnectionError);
+        assert.equal(isDeadline(err), true);
+        assert.equal(fileErrorStatus(err), undefined);
+        return true;
+      });
+    } finally {
+      clearInterval(keepAlive);
+    }
   });
 
   it("the SDK does not retry a 429 itself (the driver does)", async () => {

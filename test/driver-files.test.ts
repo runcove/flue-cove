@@ -13,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, beforeEach, describe, it } from "node:test";
-import { CoveClient, CoveConnectionError } from "@cove/sdk";
+import { CoveAPIError, CoveClient, CoveConnectionError } from "@cove/sdk";
 import {
   SandboxDiedError,
   SandboxOperationUnsupportedError,
@@ -67,7 +67,9 @@ function fsFiles(override: Partial<Record<"stat" | "download" | "upload", Error>
       if (override.stat) throw override.stat;
       check(path, "stat");
       const st = statSync(path);
-      return { size: st.size, mode: st.mode & 0o777 };
+      // Like a server that predates `Last-Modified` on HEAD; tests that
+      // want an mtime override `stat`.
+      return { size: st.size, mode: st.mode & 0o777, mtime: undefined };
     },
     async downloadBytes(_vm, path) {
       used.push(`download ${path}`);
@@ -80,6 +82,7 @@ function fsFiles(override: Partial<Record<"stat" | "download" | "upload", Error>
       return {
         size: bytes.length,
         mode: undefined,
+        mtime: undefined,
         body: new Blob([new Uint8Array(bytes)]).stream(),
       };
     },
@@ -99,7 +102,7 @@ function setup(override?: Parameters<typeof fsFiles>[0]) {
   const shell = localShellClient();
   const fake = fsFiles(override);
   const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
-  return { driver, used: fake.used, calls: shell.calls };
+  return { driver, files: fake.files, used: fake.used, calls: shell.calls };
 }
 
 let n = 0;
@@ -286,7 +289,29 @@ describe("writeFile", () => {
 });
 
 describe("stat", () => {
-  it("a regular file via HEAD: type, size, not a symlink, no invented mtime", async () => {
+  it("a regular file via HEAD carries the server's Last-Modified as mtime", async () => {
+    const { driver, files, calls } = setup();
+    writeFileSync(join(dir, "f"), "12345");
+    const when = new Date("2026-10-05T08:00:00Z");
+    files.stat = async () => ({ size: 5, mode: 0o644, mtime: when });
+    const st = await driver.stat(join(dir, "f"));
+    assert.deepEqual(st, {
+      isFile: true,
+      isDirectory: false,
+      isSymbolicLink: false,
+      size: 5,
+      mtime: when,
+    });
+    assert.equal(calls.length, 0);
+  });
+
+  it("an unparseable mtime is left out, not passed on", async () => {
+    const { driver, files } = setup();
+    files.stat = async () => ({ size: 5, mode: 0o644, mtime: new Date(Number.NaN) });
+    assert.equal("mtime" in (await driver.stat(join(dir, "f"))), false);
+  });
+
+  it("a regular file via HEAD from a server without Last-Modified: no invented mtime", async () => {
     const { driver, calls } = setup();
     writeFileSync(join(dir, "f"), "12345");
     const st = await driver.stat(join(dir, "f"));
@@ -590,9 +615,94 @@ describe("fallback rules, one per refusal", () => {
     assert.equal(calls.length, 2, "no exec fallback for content");
   });
 
-  it("HEAD 404 has no code, so it reads as a missing file even if the VM is gone", async () => {
-    // A HEAD error has no body: vm_not_found and file_not_found are both a
-    // bare 404. The route itself exists: its probe of `/` answers 400.
+  it("HEAD 404 file_not_found (X-Cove-Error-Code) is ENOENT with no probe and no exec", async () => {
+    const shell = localShellClient();
+    const fake = fsFiles();
+    fake.files.stat = async (_vm, path) => {
+      fake.used.push(`stat ${path}`);
+      throw CoveAPIError.fromResponse(404, undefined, undefined, "file_not_found");
+    };
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+    await assert.rejects(driver.stat(join(dir, "f")), { code: "ENOENT" });
+    assert.equal(await driver.exists(join(dir, "f")), false);
+    assert.equal(driver.fileRoute, "present");
+    assert.ok(!fake.used.includes("stat /"), "no probe");
+    assert.equal(shell.calls.length, 0);
+  });
+
+  it("HEAD 404 vm_not_found (X-Cove-Error-Code) is SandboxDiedError for stat, false for exists", async () => {
+    const shell = localShellClient();
+    const fake = fsFiles();
+    fake.files.stat = async (_vm, path) => {
+      fake.used.push(`stat ${path}`);
+      throw CoveAPIError.fromResponse(404, undefined, undefined, "vm_not_found");
+    };
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+    await assert.rejects(driver.stat(join(dir, "f")), SandboxDiedError);
+    assert.equal(await driver.exists(join(dir, "f")), false);
+    assert.ok(!fake.used.includes("stat /"), "no probe");
+    assert.equal(shell.calls.length, 0);
+  });
+
+  it("HEAD 403 file_path_denied and scope_denied (X-Cove-Error-Code) fall back to exec as before", async () => {
+    for (const code of ["file_path_denied", "scope_denied"]) {
+      const shell = localShellClient();
+      const fake = fsFiles({
+        stat: CoveAPIError.fromResponse(403, undefined, undefined, code),
+      });
+      const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+      writeFileSync(join(dir, "f"), "abc");
+      assert.equal((await driver.stat(join(dir, "f"))).size, 3, code);
+      assert.equal(await driver.exists(join(dir, "f")), true, code);
+      assert.ok(shell.calls.length > 0, code);
+    }
+  });
+
+  it("HEAD 403 scope_denied (X-Cove-Error-Code) is remembered: later reads skip the API", async () => {
+    const shell = localShellClient();
+    const fake = fsFiles({
+      stat: CoveAPIError.fromResponse(403, undefined, undefined, "scope_denied"),
+    });
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+    writeFileSync(join(dir, "f"), "abc");
+    assert.equal((await driver.stat(join(dir, "f"))).size, 3);
+    assert.equal(await driver.readFile(join(dir, "f")), "abc");
+    assert.deepEqual(fake.used, [`stat ${dir}/f`], "the read never tried the API");
+  });
+
+  it("a codeless HEAD 403 (older server) is not remembered: reads still use the API", async () => {
+    const shell = localShellClient();
+    const fake = fsFiles({ stat: apiError(403) });
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+    writeFileSync(join(dir, "f"), "abc");
+    assert.equal((await driver.stat(join(dir, "f"))).size, 3);
+    assert.equal(await driver.readFile(join(dir, "f")), "abc");
+    assert.ok(fake.used.includes(`download ${dir}/f`));
+  });
+
+  it("HEAD 409 invalid_state_transition (X-Cove-Error-Code) is SandboxDiedError, no exec", async () => {
+    const shell = localShellClient();
+    const fake = fsFiles({
+      stat: CoveAPIError.fromResponse(409, undefined, undefined, "invalid_state_transition"),
+    });
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+    await assert.rejects(driver.stat(join(dir, "f")), SandboxDiedError);
+    assert.equal(shell.calls.length, 0);
+  });
+
+  it("a codeless HEAD 409 (older server) falls back to exec as before", async () => {
+    const shell = localShellClient();
+    const fake = fsFiles({ stat: apiError(409) });
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+    writeFileSync(join(dir, "f"), "abc");
+    assert.equal((await driver.stat(join(dir, "f"))).size, 3);
+    assert.ok(shell.calls.length > 0);
+  });
+
+  it("HEAD 404 with no code (a server without X-Cove-Error-Code) reads as a missing file even if the VM is gone", async () => {
+    // An older server's HEAD error has no body and no code header:
+    // vm_not_found and file_not_found are both a bare 404. The route itself
+    // exists: its probe of `/` answers 400.
     const shell = localShellClient();
     const fake = fsFiles();
     fake.files.stat = async (_vm, path) => {

@@ -369,4 +369,4 @@ Changes, including breaking ones, are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE).

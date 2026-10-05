@@ -4,6 +4,15 @@ All notable changes to `flue-cove`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor bump may break).
 
+## [Unreleased]
+
+### Changed
+
+- Licensed under Apache-2.0: `LICENSE` is the unmodified Apache License 2.0
+  text, `package.json` declares `"license": "Apache-2.0"`, and `LICENSE` is
+  listed in `files`. The package stays `"private": true` until it is
+  published.
+
 ## [0.3.0]
 
 The vendored SDK is `@cove/sdk` 0.4.0 rebuilt from Cove commit `bde79e442`

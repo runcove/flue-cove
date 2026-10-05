@@ -4,8 +4,8 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
-const TARBALL = "vendor/cove-sdk-0.4.0-cb09494.tgz";
-const EXPECTED_SHA256 = "731e8df2865f9b34870185722713a2757b5217bc845b0cccf3159cb996ddce25";
+const TARBALL = "vendor/cove-sdk-0.4.0-bde79e4.tgz";
+const EXPECTED_SHA256 = "25b0e618e9a2f98cbfb802c9f2e4045564153a1adf0150ac279c2b6bcdcaad5e";
 
 let failed = false;
 const fail = (msg) => {

@@ -2,11 +2,12 @@
  * Retrying calls that Cove refused with 429. The API rate-limits each source
  * address (a token bucket, 30 requests/s by default) and rejects the excess
  * before any handler runs, so a 429'd request did nothing and is safe to
- * resend, a POST included. `@cove/sdk` 0.4.0 neither retries a 429 itself
- * (its file methods included) nor exposes `Retry-After`, so the retry lives
- * here and the wait is a short exponential backoff with jitter (runcove-413g9).
+ * resend, a POST included. `@cove/sdk` never retries a 429 itself (its file
+ * methods included), so the retry lives here. The SDK exposes the answer's
+ * `Retry-After` as `retryAfterSecs` (runcove-413g9): when present it sets the
+ * wait (capped), otherwise the wait is a short exponential backoff with jitter.
  */
-import { apiErrorStatus } from "./errors.ts";
+import { apiErrorStatus, retryAfterSecs } from "./errors.ts";
 
 /** A 429 from any copy of the SDK (recognised by shape, see `errors.ts`). */
 export function isRateLimited(err: unknown): boolean {
@@ -37,6 +38,21 @@ export function backoffMs(retry: number, baseDelayMs = 250): number {
   return Math.min(baseDelayMs * 2 ** retry, 4000) + Math.random() * baseDelayMs;
 }
 
+/** The longest `Retry-After` honoured; a longer one is waited for this long. */
+export const MAX_RETRY_AFTER_MS = 30_000;
+
+/**
+ * How long to wait before retry number `retry` (0-based) of a call that
+ * failed with `err`: the server's `Retry-After` when it sent one (capped at
+ * {@link MAX_RETRY_AFTER_MS}, plus jitter so callers sharing an address do
+ * not return in step), else {@link backoffMs}.
+ */
+export function retryDelayMs(err: unknown, retry: number, baseDelayMs = 250): number {
+  const secs = retryAfterSecs(err);
+  if (secs === undefined) return backoffMs(retry, baseDelayMs);
+  return Math.min(secs * 1000, MAX_RETRY_AFTER_MS) + Math.random() * baseDelayMs;
+}
+
 export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -65,7 +81,7 @@ export async function withRateLimitRetry<T>(
       return await fn();
     } catch (err) {
       if (!(opts.retryOn ?? isRateLimited)(err) || i >= attempts - 1) throw err;
-      await abortableSleep(backoffMs(i, opts.baseDelayMs), opts.signal);
+      await abortableSleep(retryDelayMs(err, i, opts.baseDelayMs), opts.signal);
     }
   }
 }

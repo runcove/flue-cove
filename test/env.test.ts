@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { inspect } from "node:util";
-import { CoveClient } from "@cove/sdk";
+import { CoveClient, CoveConfigError, CoveTimeoutError } from "@cove/sdk";
 import { createCoveClient, fromEnv } from "../src/client.ts";
 import { filesFor } from "../src/files.ts";
 
@@ -83,6 +83,29 @@ describe("fromEnv", () => {
     );
   });
 
+  it("configuration mistakes are CoveConfigError", () => {
+    const file = join(dir, "blank_key");
+    writeFileSync(file, "\n");
+    for (const env of [
+      { COVE_API_KEY: KEY },
+      { COVE_API_URL: "https://cove.example.com" },
+      { COVE_API_URL: "https://cove.example.com", COVE_API_KEY_FILE: join(dir, "missing") },
+      { COVE_API_URL: "https://cove.example.com", COVE_API_KEY_FILE: file },
+      { COVE_API_URL: "http://cove.example.com", COVE_API_KEY: KEY },
+      { COVE_API_URL: "ftp://cove.example.com", COVE_API_KEY: KEY },
+      { COVE_API_URL: "not a url", COVE_API_KEY: KEY },
+    ]) {
+      assert.throws(
+        () => fromEnv(env),
+        (err: unknown) => {
+          assert.ok(err instanceof CoveConfigError, `${JSON.stringify(env)}: ${String(err)}`);
+          noKey(err);
+          return true;
+        },
+      );
+    }
+  });
+
   it("errors from a bad URL never carry the key", () => {
     assert.throws(
       () => fromEnv({ COVE_API_URL: "http://cove.example.com", COVE_API_KEY: KEY }),
@@ -114,5 +137,7 @@ describe("package exports", () => {
   it("re-exports the bundled SDK's CoveClient, so apps can build from the same copy", async () => {
     const index = await import("../src/index.ts");
     assert.equal(index.CoveClient, CoveClient);
+    assert.equal(index.CoveConfigError, CoveConfigError);
+    assert.equal(index.CoveTimeoutError, CoveTimeoutError);
   });
 });

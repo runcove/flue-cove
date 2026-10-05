@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
-import { ConflictError, NotFoundError, RateLimitError } from "@cove/sdk";
+import { ConflictError, CoveTimeoutError, NotFoundError, RateLimitError } from "@cove/sdk";
 import { SandboxDiedError, sandboxFromDriver } from "@flue/runtime";
 import {
   type CoveExecClient,
@@ -439,7 +439,28 @@ describe("exec: secrets timers", () => {
     assert.deepEqual(res, { stdout: "done\n", stderr: "", exitCode: 0 });
   });
 
-  it("an SDK request timeout (TimeoutError) also kills the guest command", async () => {
+  it("an SDK request deadline (CoveTimeoutError) also kills the guest command", async () => {
+    const marker = join(dir, "sdk-cove-timeout-marker");
+    const shell = localShellClient();
+    const client = {
+      vms: {
+        exec: shell.client.vms.exec,
+        execWithSecrets: async (vm: string, opts: { command: string[] }) => {
+          // Start the command, then fail the request the way the SDK's deadline does.
+          void shell.client.vms.execWithSecrets(vm, { ...opts, selector: { kind: "all" } });
+          await sleep(300);
+          const cause = new DOMException("Request timed out after 300 ms", "TimeoutError");
+          throw new CoveTimeoutError(cause.message, { cause });
+        },
+      },
+    } as unknown as CoveExecClient;
+    const driver = new CoveSandboxDriver(client, "vm", { secrets: { kind: "all" } });
+    await assert.rejects(driver.exec(`sleep 2; touch '${marker}'`), CoveTimeoutError);
+    await sleep(2500);
+    assert.equal(existsSync(marker), false);
+  });
+
+  it("an older SDK copy's request timeout (TimeoutError) also kills the guest command", async () => {
     const marker = join(dir, "sdk-timeout-marker");
     const shell = localShellClient();
     const client = {

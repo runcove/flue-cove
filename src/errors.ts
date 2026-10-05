@@ -41,3 +41,26 @@ export function isPlainCoveError(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;
   return (err as { name?: unknown }).name === "CoveError" && apiErrorStatus(err) === undefined;
 }
+
+/**
+ * True when a request's deadline expired. `@cove/sdk` raises its `timeoutMs`
+ * deadline as `CoveTimeoutError`; an older copy let the platform's
+ * `DOMException` named `TimeoutError` through instead, as does a caller's own
+ * `AbortSignal.timeout()`. Recognised by name, from any copy of the SDK.
+ */
+export function isDeadline(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const name = (err as { name?: unknown }).name;
+  return name === "CoveTimeoutError" || name === "TimeoutError";
+}
+
+/**
+ * The wait a 429 or 5xx asked for with `Retry-After`, in seconds, as the SDK
+ * parsed it (`retryAfterSecs`, delta-seconds only), or `undefined` when the
+ * answer had none or the error is not an SDK API error.
+ */
+export function retryAfterSecs(err: unknown): number | undefined {
+  if (apiErrorStatus(err) === undefined) return undefined;
+  const secs = (err as { retryAfterSecs?: unknown }).retryAfterSecs;
+  return typeof secs === "number" && Number.isFinite(secs) && secs >= 0 ? secs : undefined;
+}

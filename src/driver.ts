@@ -22,14 +22,14 @@ import {
   SandboxOperationUnsupportedError,
   type ShellResult,
 } from "@flue/runtime";
-import { apiErrorStatus, isPlainCoveError } from "./errors.ts";
+import { apiErrorStatus, isDeadline, isPlainCoveError } from "./errors.ts";
 import { type CoveFiles, fileErrorStatus } from "./files.ts";
 import { buildScript } from "./quote.ts";
 import {
   abortableSleep,
-  backoffMs,
   isRateLimited,
   isTransientFileError,
+  retryDelayMs,
   withRateLimitRetry,
 } from "./retry.ts";
 
@@ -208,10 +208,12 @@ function vmGone(status: number, code: string | undefined): boolean {
 
 /**
  * Whether a file-API refusal is one a shell in the guest can still serve.
- * HEAD errors carry no body, hence no code: a HEAD 403 or 409 cannot be told
- * from its other causes, so it falls back too (the exec then reports the real
- * problem, e.g. a VM that is not running). A HEAD 422 is any kind of
- * "not a regular file", which is exactly what the fallback handles.
+ * HEAD errors carry no body. A current server names the code in
+ * `X-Cove-Error-Code`, which the SDK reads; an older one sends none, so a
+ * codeless HEAD 403 or 409 cannot be told from its other causes and falls
+ * back too (the exec then reports the real problem, e.g. a VM that is not
+ * running). A HEAD 422 is any kind of "not a regular file", which is exactly
+ * what the fallback handles.
  */
 function canFallBack(
   err: { status: number; code: string | undefined },
@@ -408,10 +410,10 @@ export class CoveSandboxDriver implements SandboxDriver {
   /** Map an exec failure; on a caller abort, also kill the orphaned guest command. */
   #execFailure(err: unknown, pidFile: string, signal: AbortSignal | undefined): unknown {
     // Cove does not stop a command when its request goes away (runcove-ckxuu):
-    // on a caller abort, or the SDK's own request deadline (TimeoutError),
-    // kill the group out of band. The caller has already been released, so
-    // nobody waits on this.
-    if (signal?.aborted || (err instanceof Error && err.name === "TimeoutError")) {
+    // on a caller abort, or the SDK's own request deadline (`CoveTimeoutError`,
+    // or `TimeoutError` from an older SDK copy), kill the group out of band.
+    // The caller has already been released, so nobody waits on this.
+    if (signal?.aborted || isDeadline(err)) {
       void this.#killGroup(pidFile);
       return err;
     }
@@ -438,7 +440,7 @@ export class CoveSandboxDriver implements SandboxDriver {
         return;
       } catch (err) {
         if (started || !isRateLimited(err) || retry >= RATE_LIMIT_RETRIES) throw err;
-        await abortableSleep(backoffMs(retry), signal);
+        await abortableSleep(retryDelayMs(err, retry), signal);
       }
     }
   }
@@ -510,8 +512,9 @@ export class CoveSandboxDriver implements SandboxDriver {
 
   /**
    * Whether the server lacks the file route, for a HEAD that answered a bare
-   * 404. A HEAD error has no body, so that 404 may be a missing file, a
-   * missing VM or a missing route. A server with the route answers 404 only
+   * 404. A HEAD error has no body; a server with the route names its code in
+   * `X-Cove-Error-Code` unless it predates that header, so a codeless 404 may
+   * be a missing file, a missing VM or a missing route. A server with the route answers 404 only
    * after it has found the VM, and refuses the path `/` (an empty component)
    * with 400 before any guest call; a server without it answers its
    * router's bare 404 to that probe too. Probed once per driver. A probe that
@@ -570,8 +573,10 @@ export class CoveSandboxDriver implements SandboxDriver {
       return;
     }
     if (vmGone(http.status, http.code)) throw died(operation);
-    // A HEAD 404 has no code, so it may also mean the VM is gone; reporting
-    // ENOENT then is the closest honest answer (the next exec will say more).
+    // A codeless HEAD 404 (a server without `X-Cove-Error-Code`) may also
+    // mean the VM is gone; reporting ENOENT then is the closest honest answer
+    // (the next exec will say more). With the header, `vm_not_found` is
+    // handled above.
     if (http.status === 404) throw fsError("ENOENT", operation, path, "no such file or directory");
     if (http.status === 403 && http.code === "scope_denied") {
       if (op === "upload") this.#writeScopeDenied = true;
@@ -660,9 +665,13 @@ export class CoveSandboxDriver implements SandboxDriver {
         const info = await withRateLimitRetry(() => files.stat(this.#vm, path), FILE_RETRY);
         this.#routeSeen();
         // A 200 means a regular file with no symlink anywhere in its path.
-        // HEAD carries no modification time, so mtime is left out (runcove-1cl10).
+        // The modification time comes from `Last-Modified` (whole seconds);
+        // a server that predates it sends none, and mtime is then left out
+        // rather than invented (runcove-1cl10).
         const st: FileStat = { isFile: true, isDirectory: false, isSymbolicLink: false };
         if (Number.isFinite(info.size)) st.size = info.size;
+        const mtime = info.mtime;
+        if (mtime instanceof Date && Number.isFinite(mtime.getTime())) st.mtime = mtime;
         return st;
       } catch (err) {
         // A bare HEAD 404 on a server without the file route: ask the shell.
@@ -698,11 +707,18 @@ export class CoveSandboxDriver implements SandboxDriver {
           this.#routeSeen();
           return true;
         } catch (err) {
-          // 404 (file or, for a HEAD, possibly the VM: HEAD errors carry no
-          // code, runcove-1cl10) reads as "not there", unless the server has
-          // no file route at all, which the shell then answers for.
-          if (fileErrorStatus(err)?.status === 404 && !(await this.#routeAbsent(files))) {
-            return false;
+          // 404 reads as "not there". With a code (`file_not_found`, or
+          // `vm_not_found`) it came from the file route itself. A codeless
+          // one (a server without `X-Cove-Error-Code`, runcove-1cl10) may
+          // also be a server with no file route at all, which the shell then
+          // answers for.
+          const http = fileErrorStatus(err);
+          if (http?.status === 404) {
+            if (http.code !== undefined) {
+              if (FILE_ROUTE_CODES.has(http.code)) this.#routeSeen();
+              return false;
+            }
+            if (!(await this.#routeAbsent(files))) return false;
           }
           // Anything else (directory, symlink, denied, transport): ask the shell.
         }
@@ -750,7 +766,10 @@ const FILE_ROUTE_CODES = new Set([
   "file_too_large",
 ]);
 
-/** A 404 with no code: what a HEAD error (no body) or a missing route answers. */
+/**
+ * A 404 with no code: what a missing route answers, or a HEAD error (no body)
+ * from a server that predates `X-Cove-Error-Code`.
+ */
 function isBare404(err: unknown): boolean {
   const http = fileErrorStatus(err);
   return http?.status === 404 && http.code === undefined;

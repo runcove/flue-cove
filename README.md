@@ -23,7 +23,7 @@ It implements Flue's [Sandbox Adapter API](https://flueframework.com/docs/refere
 ## Install
 
 `@cove/sdk` is not on a public registry, so this repository vendors it
-(`vendor/cove-sdk-0.4.0-cb09494.tgz`; see [vendor/README.md](vendor/README.md)).
+(`vendor/cove-sdk-0.4.0-bde79e4.tgz`; see [vendor/README.md](vendor/README.md)).
 Install `flue-cove` from a clone or from a packed tarball, next to
 `@flue/runtime` (a peer dependency):
 
@@ -34,8 +34,8 @@ cd flue-cove && npm ci && npm run build
 cd ../my-flue-app && npm install --install-links ../flue-cove @flue/runtime@2.2.2
 
 # or from a tarball (the SDK is bundled inside it)
-cd flue-cove && npm pack            # → flue-cove-0.2.0.tgz
-cd ../my-flue-app && npm install ../flue-cove/flue-cove-0.2.0.tgz @flue/runtime@2.2.2
+cd flue-cove && npm pack            # → flue-cove-0.3.0.tgz
+cd ../my-flue-app && npm install ../flue-cove/flue-cove-0.3.0.tgz @flue/runtime@2.2.2
 ```
 
 Install a *copy*, never a symlink: a plain `npm install ../flue-cove` links
@@ -52,7 +52,10 @@ a server build that includes Cove commit `537fb91a3` (the file-transfer
 endpoints), or the first release after `cove-server` 0.33.2; the 0.33.2 tag
 itself has no file routes. A pre-release build with them may still report
 version 0.33.2. Older servers work too, more slowly: the adapter notices that
-the route is missing and runs every file operation over exec.
+the route is missing and runs every file operation over exec. A server that
+includes Cove commit `03cbc7539` also names a `HEAD` error's code
+(`X-Cove-Error-Code`) and sends `Last-Modified`, so `stat` tells a missing
+VM from a missing file and returns `mtime`.
 
 ## Configuration
 
@@ -207,7 +210,8 @@ the fallback. 404 is `ENOENT`. 413 `file_too_large` is an error for
 `readFile`/`readFileBuffer`/`writeFile`; `stat` and `exists` fall back to exec
 on it, since a shell can still stat a file too big to transfer. A VM that is not running or is gone becomes Flue's
 `SandboxDiedError`, as does a `paused` event in the middle of an exec. 429
-(rate limit) and file-API 503 (`unavailable`) are retried with backoff. A
+(rate limit) and file-API 503 (`unavailable`) are retried, waiting for the
+server's `Retry-After` when it sends one (at most 30 s), else with backoff. A
 `200` the SDK cannot trust (no readable `Content-Length`, or a
 `Content-Encoding` such as gzip added by a proxy) also sends `stat`, `exists`
 and reads to exec. A download whose body stops short of its `Content-Length`
@@ -217,8 +221,10 @@ taken for a complete file.
 A server that predates the file API answers every `/files` request with its
 router's bare 404, which has no error code. The real route always names what
 is missing on a `GET` or `PUT` (`vm_not_found` or `file_not_found`), so a
-codeless 404 there means "no route". A `HEAD` error never has a body, so the
-first bare `HEAD` 404 is checked once per driver with a probe: `HEAD` of the
+codeless 404 there means "no route". A `HEAD` error never has a body; a
+current server names its code in `X-Cove-Error-Code`, but one that predates
+that header sends a bare 404 for a missing file or VM too. So the first bare
+`HEAD` 404 is checked once per driver with a probe: `HEAD` of the
 path `/`, which the route refuses with 400 before touching the guest and an
 old server answers with the same bare 404. Only those two answers are
 recorded. Anything else (no answer, a 429 or 5xx after the retries, a 401 or
@@ -264,9 +270,11 @@ These were measured against a Cove server built after 0.33.2 that includes the f
   Cove drops that command's output (and the command may then die of
   `SIGPIPE`). The adapter's own transfers use base64, so file content is safe;
   output of your own commands is not, so pipe binary output through `base64`.
-- **`stat` over the file API has no `mtime`**: `HEAD` returns size and mode
-  only. `mtime` is left out rather than invented; it is present when the
-  exec fallback answers (directories, symlinks).
+- **`stat` over the file API has `mtime` only from a current server**: it
+  comes from `Last-Modified`, in whole seconds. A server that predates it
+  sends size and mode only, and `mtime` is then left out rather than
+  invented; it is always present when the exec fallback answers
+  (directories, symlinks).
 - **Size cap.** The file API refuses files above the server's `[files]
   max_bytes` (100 MiB by default) with 413. Reads and writes of such a file
   fail; there is no exec fallback for content (`stat`/`exists` still work).
@@ -321,8 +329,38 @@ error classes (`FileTooLargeError`, `FilePathDeniedError`,
 `DownloadTruncatedError`). The driver classifies a failure only by its HTTP
 status and API `code` (`fileErrorStatus`), never by its message. A key
 without `files:read`/`files:write` is the SDK's plain `PermissionDeniedError`
-with code `scope_denied`; a `HEAD` error has no body, so `stat`'s 403 and 404
-carry no code. The SDK does not retry 429s; the driver does.
+with code `scope_denied`. A `HEAD` error has no body: a current server sends
+its code in `X-Cove-Error-Code`, which the SDK reads, and from an older one
+`stat`'s 403 and 404 carry no code. The SDK's own request deadline is
+`CoveTimeoutError` and a client misconfiguration `CoveConfigError`. The SDK
+does not retry 429s; the driver does, using the `Retry-After` the SDK exposes
+as `retryAfterSecs`.
+
+### Moving to a released Cove SDK
+
+The vendored SDK is built from Cove's main branch until a Cove release
+carries one. Once it does, one command swaps it for the released tarball:
+
+```sh
+# from the release's assets (FORGE_TOKEN, if the repository is private)
+npm run update:cove-sdk -- --release https://<forge>/<owner>/cove/releases/download/<tag> \
+  --expect-sha256 <the release's cove_sdk_typescript_sha256 pin>
+# or from a Cove server that stages it (its Warpgate-fronted URL)
+npm run update:cove-sdk -- --server https://<cove-host>
+# or from a file already downloaded
+npm run update:cove-sdk -- --file cove-sdk-typescript.tgz --sha256-sum sha256.sum
+```
+
+It verifies the tarball's sha256 against the release's `sha256.sum` or the
+server's `/public/sdk/index.json` (and against `--expect-sha256` when given;
+it refuses an unverified file), checks that it is `@cove/sdk`, and then
+vendors it as `vendor/cove-sdk-<version>.tgz`, removes the old tarball,
+updates `package.json`, `scripts/check-vendor.mjs`, `vendor/README.md`, this
+README and the example's lockfile, bumps flue-cove's version (`--bump
+patch`, the default, or `minor`), adds a CHANGELOG entry, runs `npm install`
+and `npm run check:vendor`. `--dry-run` only verifies. Then run the
+typecheck, lint, unit tests and the integration test, read the CHANGELOG
+entry, and commit.
 
 Changes, including breaking ones, are listed in [CHANGELOG.md](CHANGELOG.md).
 

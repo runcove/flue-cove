@@ -1,12 +1,64 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { CoveAPIError, RateLimitError } from "@cove/sdk";
+import { CoveAPIError, RateLimitError, ServerError } from "@cove/sdk";
 import { CoveSandboxDriver } from "../src/driver.ts";
 import type { CoveFiles } from "../src/files.ts";
-import { isRateLimited, withRateLimitRetry } from "../src/retry.ts";
+import {
+  isRateLimited,
+  MAX_RETRY_AFTER_MS,
+  retryDelayMs,
+  withRateLimitRetry,
+} from "../src/retry.ts";
 import { apiError, scriptedClient } from "./helpers.ts";
 
 const limited = () => new RateLimitError(429, "HTTP 429: Too Many Requests");
+
+describe("Retry-After", () => {
+  it("a 429 or 5xx with Retry-After waits that long, plus jitter under the base delay", () => {
+    for (const err of [
+      new RateLimitError(429, "slow down", "rate_limited", undefined, 2),
+      new ServerError(503, "busy", "unavailable", undefined, 2),
+    ]) {
+      const ms = retryDelayMs(err, 0, 10);
+      assert.ok(ms >= 2000 && ms < 2010, `${ms}`);
+    }
+  });
+
+  it("a long Retry-After is capped", () => {
+    const ms = retryDelayMs(new RateLimitError(429, "x", "rate_limited", undefined, 3600), 0, 10);
+    assert.ok(ms >= MAX_RETRY_AFTER_MS && ms < MAX_RETRY_AFTER_MS + 10, `${ms}`);
+  });
+
+  it("without Retry-After, the exponential backoff applies", () => {
+    const ms = retryDelayMs(limited(), 3, 10);
+    assert.ok(ms >= 80 && ms < 90, `${ms}`);
+    assert.ok(retryDelayMs(new Error("x"), 0, 10) < 20);
+  });
+
+  it("a 429 from another SDK copy is read by shape", () => {
+    const foreign = Object.assign(new Error("HTTP 429"), {
+      status: 429,
+      code: "rate_limited",
+      retryAfterSecs: 1,
+    });
+    const ms = retryDelayMs(foreign, 0, 10);
+    assert.ok(ms >= 1000 && ms < 1010, `${ms}`);
+  });
+
+  it("withRateLimitRetry waits what Retry-After asks", async () => {
+    let n = 0;
+    const started = Date.now();
+    await withRateLimitRetry(
+      async () => {
+        if (++n < 2) throw new RateLimitError(429, "x", "rate_limited", undefined, 0);
+        return "ok";
+      },
+      { baseDelayMs: 1 },
+    );
+    assert.equal(n, 2);
+    assert.ok(Date.now() - started < 1000);
+  });
+});
 
 describe("rate limiting (429)", () => {
   it("recognises the SDK's 429s, nothing else", () => {
@@ -89,12 +141,17 @@ describe("rate limiting (429)", () => {
   it("file operations retry a 503 unavailable, then give up", async () => {
     let n = 0;
     const files: CoveFiles = {
-      stat: async () => ({ size: 0, mode: undefined }),
+      stat: async () => ({ size: 0, mode: undefined, mtime: undefined }),
       upload: async () => {
         n++;
         throw apiError(503, "unavailable", "guest agent timed out");
       },
-      download: async () => ({ size: 0, mode: undefined, body: new Blob([]).stream() }),
+      download: async () => ({
+        size: 0,
+        mode: undefined,
+        mtime: undefined,
+        body: new Blob([]).stream(),
+      }),
       downloadBytes: async () => new Uint8Array(),
     };
     const { client } = scriptedClient(() => []);
@@ -106,9 +163,14 @@ describe("rate limiting (429)", () => {
   it("file operations retry a 429", async () => {
     let n = 0;
     const files: CoveFiles = {
-      stat: async () => ({ size: 0, mode: undefined }),
+      stat: async () => ({ size: 0, mode: undefined, mtime: undefined }),
       upload: async (_vm, path) => ({ path, size: 0, mode: 0o644, sha256: "" }),
-      download: async () => ({ size: 0, mode: undefined, body: new Blob([]).stream() }),
+      download: async () => ({
+        size: 0,
+        mode: undefined,
+        mtime: undefined,
+        body: new Blob([]).stream(),
+      }),
       downloadBytes: async () => {
         if (++n < 2) throw apiError(429);
         return new TextEncoder().encode("data");

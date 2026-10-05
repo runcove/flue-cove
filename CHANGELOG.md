@@ -4,6 +4,42 @@ All notable changes to `flue-cove`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor bump may break).
 
+## [0.3.0]
+
+The vendored SDK is `@cove/sdk` 0.4.0 rebuilt from Cove commit `bde79e442`
+(main, ahead of the next release; see `vendor/README.md`). It brings the
+SDK's deadline and configuration errors, `Retry-After`, HEAD error codes and
+`stat`'s modification time. The file-API fallback rules are unchanged.
+
+### Changed
+
+- `fromEnv()` throws the SDK's `CoveConfigError` (a `CoveError`, so still an
+  `Error`) for a missing or unreadable `COVE_API_URL`/`COVE_API_KEY(_FILE)`
+  and for a URL the SDK refuses (malformed, not `http(s)`, or plain `http://`
+  to a non-loopback host). It used to throw a plain `Error`. The key is still
+  redacted from every message.
+- An SDK request deadline is now `CoveTimeoutError` (a `CoveConnectionError`),
+  no longer the platform's `TimeoutError`. The driver recognises both by name
+  and still kills the guest command's process group when one ends an exec.
+- `stat` and `exists` read the code a current server sends with a `HEAD` error
+  (`X-Cove-Error-Code`). A `HEAD` 404 `vm_not_found` makes `stat` throw Flue's
+  `SandboxDiedError` instead of `ENOENT`; a `HEAD` 404 `file_not_found` is
+  `ENOENT` (or `false`) without the route probe. A codeless `HEAD` error, from
+  a server that predates the header, is handled as before.
+- Retries of a 429, and of a file-API 503, wait for the server's
+  `Retry-After` when it sends one (capped at 30 s), else back off as before.
+
+### Added
+
+- `stat` over the file API returns `mtime`, from `Last-Modified`, when the
+  server sends it.
+- `CoveConfigError`, `CoveConnectionError` and `CoveTimeoutError` re-exported
+  from the bundled SDK; `isDeadline(err)` and `retryAfterSecs(err)`, which
+  recognise those answers from any copy of the SDK.
+- `scripts/update-cove-sdk.ts` (`npm run update:cove-sdk`): swaps the vendored
+  tarball for a released SDK, verified against the release's `sha256.sum` or a
+  server's `/public/sdk/index.json`, and bumps the version and this file.
+
 ## [0.2.0]
 
 File transfer now uses the Cove TypeScript SDK's own `client.vms.files`. The

@@ -6,6 +6,7 @@ import type { CoveFiles } from "../src/files.ts";
 import {
   isRateLimited,
   MAX_RETRY_AFTER_MS,
+  MAX_TOTAL_RETRY_WAIT_MS,
   retryDelayMs,
   withRateLimitRetry,
 } from "../src/retry.ts";
@@ -50,13 +51,43 @@ describe("Retry-After", () => {
     const started = Date.now();
     await withRateLimitRetry(
       async () => {
-        if (++n < 2) throw new RateLimitError(429, "x", "rate_limited", undefined, 0);
+        if (++n < 2) throw new RateLimitError(429, "x", "rate_limited", undefined, 1);
         return "ok";
       },
       { baseDelayMs: 1 },
     );
     assert.equal(n, 2);
-    assert.ok(Date.now() - started < 1000);
+    assert.ok(Date.now() - started >= 950, `waited ${Date.now() - started} ms`);
+  });
+
+  it("a retry whose wait would pass the total budget is not made", async () => {
+    let n = 0;
+    const started = Date.now();
+    await assert.rejects(
+      withRateLimitRetry(
+        async () => {
+          n++;
+          throw new RateLimitError(429, "x", "rate_limited", undefined, 5);
+        },
+        { baseDelayMs: 1, maxTotalDelayMs: 4000 },
+      ),
+      RateLimitError,
+    );
+    assert.equal(n, 1);
+    assert.ok(Date.now() - started < 500);
+    assert.ok(MAX_TOTAL_RETRY_WAIT_MS >= MAX_RETRY_AFTER_MS);
+  });
+
+  it("exec's stream retry waits what Retry-After asks", async () => {
+    let n = 0;
+    const { client } = scriptedClient(() => {
+      if (++n < 2) throw new RateLimitError(429, "x", "rate_limited", undefined, 1);
+      return [{ kind: "exit", code: 0 }];
+    });
+    const started = Date.now();
+    await new CoveSandboxDriver(client, "vm").exec("true");
+    assert.equal(n, 2);
+    assert.ok(Date.now() - started >= 950, `waited ${Date.now() - started} ms`);
   });
 });
 

@@ -31,6 +31,12 @@ export interface RetryOptions {
   attempts?: number;
   /** First backoff; it doubles per retry, capped at 4 s. Default 250 ms. */
   baseDelayMs?: number;
+  /**
+   * The most time all the waits of one call may add up to. A retry whose
+   * wait would go past it is not made: the error is thrown instead. Default
+   * {@link MAX_TOTAL_RETRY_WAIT_MS}.
+   */
+  maxTotalDelayMs?: number;
   signal?: AbortSignal;
 }
 
@@ -39,7 +45,14 @@ export function backoffMs(retry: number, baseDelayMs = 250): number {
 }
 
 /** The longest `Retry-After` honoured; a longer one is waited for this long. */
-export const MAX_RETRY_AFTER_MS = 30_000;
+export const MAX_RETRY_AFTER_MS = 10_000;
+
+/**
+ * The most time the waits between retries of one call add up to (by default):
+ * a server, or a proxy, asking for long waits again and again cannot hold a
+ * call (most have no abort signal) for longer than this.
+ */
+export const MAX_TOTAL_RETRY_WAIT_MS = 30_000;
 
 /**
  * How long to wait before retry number `retry` (0-based) of a call that
@@ -76,12 +89,17 @@ export async function withRateLimitRetry<T>(
   opts: RetryOptions = {},
 ): Promise<T> {
   const attempts = opts.attempts ?? 8;
+  const budget = opts.maxTotalDelayMs ?? MAX_TOTAL_RETRY_WAIT_MS;
+  let waited = 0;
   for (let i = 0; ; i++) {
     try {
       return await fn();
     } catch (err) {
       if (!(opts.retryOn ?? isRateLimited)(err) || i >= attempts - 1) throw err;
-      await abortableSleep(retryDelayMs(err, i, opts.baseDelayMs), opts.signal);
+      const delay = retryDelayMs(err, i, opts.baseDelayMs);
+      if (waited + delay > budget) throw err;
+      waited += delay;
+      await abortableSleep(delay, opts.signal);
     }
   }
 }

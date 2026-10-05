@@ -29,6 +29,7 @@ import {
   abortableSleep,
   isRateLimited,
   isTransientFileError,
+  MAX_TOTAL_RETRY_WAIT_MS,
   retryDelayMs,
   withRateLimitRetry,
 } from "./retry.ts";
@@ -430,6 +431,7 @@ export class CoveSandboxDriver implements SandboxDriver {
     opts: { command: string[]; timeoutSecs?: number },
     signal: AbortSignal | undefined,
   ): AsyncGenerator<ExecEvent> {
+    let waited = 0;
     for (let retry = 0; ; retry++) {
       let started = false;
       try {
@@ -440,7 +442,10 @@ export class CoveSandboxDriver implements SandboxDriver {
         return;
       } catch (err) {
         if (started || !isRateLimited(err) || retry >= RATE_LIMIT_RETRIES) throw err;
-        await abortableSleep(retryDelayMs(err, retry), signal);
+        const delay = retryDelayMs(err, retry);
+        if (waited + delay > MAX_TOTAL_RETRY_WAIT_MS) throw err;
+        waited += delay;
+        await abortableSleep(delay, signal);
       }
     }
   }

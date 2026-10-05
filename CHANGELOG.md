@@ -9,7 +9,9 @@ All notable changes to `flue-cove`. The format follows
 The vendored SDK is `@cove/sdk` 0.4.0 rebuilt from Cove commit `bde79e442`
 (main, ahead of the next release; see `vendor/README.md`). It brings the
 SDK's deadline and configuration errors, `Retry-After`, HEAD error codes and
-`stat`'s modification time. The file-API fallback rules are unchanged.
+`stat`'s modification time. The file-API fallback rules are unchanged; a
+`HEAD` error that now carries a code takes the branch that code always took
+on a `GET` or `PUT`.
 
 ### Changed
 
@@ -26,8 +28,14 @@ SDK's deadline and configuration errors, `Retry-After`, HEAD error codes and
   `SandboxDiedError` instead of `ENOENT`; a `HEAD` 404 `file_not_found` is
   `ENOENT` (or `false`) without the route probe. A codeless `HEAD` error, from
   a server that predates the header, is handled as before.
+- A `HEAD` 403 `scope_denied` is now remembered like a `GET`/`PUT` one (later
+  reads skip the file API), and a `HEAD` 409 `invalid_state_transition` makes
+  `stat` throw `SandboxDiedError` instead of trying exec. These follow from
+  the codes; the fallback rules themselves are unchanged.
 - Retries of a 429, and of a file-API 503, wait for the server's
-  `Retry-After` when it sends one (capped at 30 s), else back off as before.
+  `Retry-After` when it sends one (each wait capped at 10 s), else back off
+  as before. The waits of one call add up to at most 30 s; a retry that
+  would pass that is not made, and the error is thrown.
 
 ### Added
 

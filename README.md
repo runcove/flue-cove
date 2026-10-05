@@ -211,7 +211,8 @@ the fallback. 404 is `ENOENT`. 413 `file_too_large` is an error for
 on it, since a shell can still stat a file too big to transfer. A VM that is not running or is gone becomes Flue's
 `SandboxDiedError`, as does a `paused` event in the middle of an exec. 429
 (rate limit) and file-API 503 (`unavailable`) are retried, waiting for the
-server's `Retry-After` when it sends one (at most 30 s), else with backoff. A
+server's `Retry-After` when it sends one (at most 10 s a wait, 30 s in all
+for one call), else with backoff. A
 `200` the SDK cannot trust (no readable `Content-Length`, or a
 `Content-Encoding` such as gzip added by a proxy) also sends `stat`, `exists`
 and reads to exec. A download whose body stops short of its `Content-Length`
@@ -353,7 +354,9 @@ npm run update:cove-sdk -- --file cove-sdk-typescript.tgz --sha256-sum sha256.su
 
 It verifies the tarball's sha256 against the release's `sha256.sum` or the
 server's `/public/sdk/index.json` (and against `--expect-sha256` when given;
-it refuses an unverified file), checks that it is `@cove/sdk`, and then
+it refuses an unverified file; it sends `FORGE_TOKEN` over https only and
+follows no redirect, so a forge that redirects its downloads needs `--file`),
+checks that it is `@cove/sdk`, checks every file it will edit, and only then
 vendors it as `vendor/cove-sdk-<version>.tgz`, removes the old tarball,
 updates `package.json`, `scripts/check-vendor.mjs`, `vendor/README.md`, this
 README and the example's lockfile, bumps flue-cove's version (`--bump

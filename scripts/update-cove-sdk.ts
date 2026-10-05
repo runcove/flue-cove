@@ -7,7 +7,9 @@
  *                     `https://<forge>/<owner>/<repo>/releases/download/<tag>`.
  *                     Fetches `cove-sdk-typescript.tgz` and checks it against the
  *                     release's `sha256.sum`. Set FORGE_TOKEN for a private
- *                     repository (sent as `Authorization: token …`, never printed).
+ *                     repository (sent as `Authorization: token …` over https
+ *                     only, never printed). Redirects are not followed: a forge
+ *                     that redirects its downloads needs --file instead.
  *   --server <url>    A Cove server's Warpgate-fronted URL. Reads
  *                     `/public/sdk/index.json`, takes the `@cove/sdk` npm
  *                     artefact (`--version` picks one when several are staged),
@@ -22,6 +24,7 @@
  *   --bump patch|minor     How to bump flue-cove's version (default patch).
  *   --dry-run              Verify and report; change nothing.
  *   --no-install           Skip `npm install` (the lockfile is then stale).
+ *   --root <dir>           The repository to update (default: this script's).
  *
  * Then: vendor/cove-sdk-<version>.tgz replaces the old tarball; package.json,
  * scripts/check-vendor.mjs, vendor/README.md, README.md, CHANGELOG.md and the
@@ -141,7 +144,9 @@ export interface Update {
 /**
  * Apply a verified tarball to the repository at `root`. Returns what changed.
  * Refuses a tarball that is not `@cove/sdk`, one already vendored, and a
- * repository whose vendored tarball or check constants are not where expected.
+ * repository whose files are not as expected. Every file is read and every
+ * edit computed and checked first; nothing is written until all of them
+ * succeed, so a refusal leaves the repository untouched.
  */
 export function applyUpdate(root: string, up: Update): { file: string; from: string; to: string } {
   const at = (p: string) => join(root, p);
@@ -160,12 +165,10 @@ export function applyUpdate(root: string, up: Update): { file: string; from: str
   if (file !== oldFile && existsSync(at(file))) {
     throw new Error(`${file} exists already and is not the vendored tarball; remove it first`);
   }
-
-  // The tarball.
-  for (const f of readdirSync(at("vendor"))) {
-    if (/^cove-sdk-.*\.tgz$/.test(f)) unlinkSync(at(`vendor/${f}`));
-  }
-  writeFileSync(at(file), up.bytes);
+  const oldName = basename(oldFile);
+  const name = basename(file);
+  /** Every file to write, by path relative to `root`, computed before any write. */
+  const writes = new Map<string, string>();
 
   // package.json: the dependency and the version.
   const pkgText = readFileSync(at("package.json"), "utf8");
@@ -175,24 +178,25 @@ export function applyUpdate(root: string, up: Update): { file: string; from: str
   if (ours.dependencies?.["@cove/sdk"] !== `file:${oldFile}`) {
     throw new Error(`package.json does not depend on file:${oldFile}`);
   }
-  writeFileSync(
-    at("package.json"),
+  if (!/^ {2}"version": "[^"]+",$/m.test(pkgText)) {
+    throw new Error("package.json has no top-level version line");
+  }
+  writes.set(
+    "package.json",
     pkgText
       .replace(`"file:${oldFile}"`, `"file:${file}"`)
       .replace(/^ {2}"version": "[^"]+",$/m, `  "version": "${to}",`),
   );
 
   // scripts/check-vendor.mjs.
-  writeFileSync(
-    at("scripts/check-vendor.mjs"),
+  writes.set(
+    "scripts/check-vendor.mjs",
     check
       .replace(/^const TARBALL = "[^"]+";$/m, `const TARBALL = "${file}";`)
       .replace(/^const EXPECTED_SHA256 = "[^"]+";$/m, `const EXPECTED_SHA256 = "${hash}";`),
   );
 
   // vendor/README.md: the table rows.
-  const oldName = basename(oldFile);
-  const name = basename(file);
   const row = (text: string, key: string, value: string) => {
     const re = new RegExp(`^\\| ${key} \\|.*\\|$`, "m");
     if (!re.test(text)) throw new Error(`vendor/README.md has no "${key}" row`);
@@ -210,11 +214,11 @@ export function applyUpdate(root: string, up: Update): { file: string; from: str
   );
   vendorReadme = row(vendorReadme, "Built with", "the Cove release pipeline (`npm pack`)");
   vendorReadme = row(vendorReadme, "sha256", `\`${hash}\``);
-  writeFileSync(at("vendor/README.md"), vendorReadme.split(oldName).join(name));
+  writes.set("vendor/README.md", vendorReadme.split(oldName).join(name));
 
   // README.md: the vendored file's name and the packed tarball's name.
-  writeFileSync(
-    at("README.md"),
+  writes.set(
+    "README.md",
     readFileSync(at("README.md"), "utf8")
       .split(oldName)
       .join(name)
@@ -222,25 +226,34 @@ export function applyUpdate(root: string, up: Update): { file: string; from: str
       .join(`flue-cove-${to}.tgz`),
   );
 
-  // The example's lockfile: the dependency and flue-cove's version.
-  const exampleLock = at("examples/repo-agent/package-lock.json");
-  if (existsSync(exampleLock)) {
-    writeFileSync(
+  // The example's lockfile: the dependency, flue-cove's version and the
+  // bundled SDK's version.
+  const exampleLock = "examples/repo-agent/package-lock.json";
+  if (existsSync(at(exampleLock))) {
+    writes.set(
       exampleLock,
-      readFileSync(exampleLock, "utf8")
+      readFileSync(at(exampleLock), "utf8")
         .split(`file:${oldFile}`)
         .join(`file:${file}`)
         .replace(
           /("node_modules\/flue-cove": \{\s*"version": )"[^"]+"/,
           (_m, head: string) => `${head}"${to}"`,
+        )
+        .replace(
+          /("node_modules\/flue-cove\/node_modules\/@cove\/sdk": \{\s*"version": )"[^"]+"/,
+          (_m, head: string) => `${head}"${pkg.version}"`,
         ),
     );
   }
 
-  // CHANGELOG.md: a new section above the newest one.
+  // CHANGELOG.md: a new section above the newest release, below any
+  // `## [Unreleased]` section.
   const changelog = readFileSync(at("CHANGELOG.md"), "utf8");
-  const first = changelog.indexOf("\n## [");
-  if (first < 0) throw new Error("CHANGELOG.md has no version section");
+  const sections = [...changelog.matchAll(/^## \[([^\]]+)\]/gm)];
+  const newest = sections.find((m) => m[1]?.toLowerCase() !== "unreleased");
+  if (!newest || newest.index === undefined) {
+    throw new Error("CHANGELOG.md has no release section");
+  }
   const what = up.tag ? `from the Cove release \`${up.tag}\`` : `released by Cove (${up.source})`;
   const entry = [
     `## [${to}]`,
@@ -252,22 +265,39 @@ export function applyUpdate(root: string, up: Update): { file: string; from: str
     `  \`${hash}\`.`,
     "",
   ].join("\n");
-  writeFileSync(
-    at("CHANGELOG.md"),
-    `${changelog.slice(0, first + 1)}${entry}\n${changelog.slice(first + 1)}`,
+  writes.set(
+    "CHANGELOG.md",
+    `${changelog.slice(0, newest.index)}${entry}\n${changelog.slice(newest.index)}`,
   );
 
+  // Everything checked: write. The new tarball first, then the old one goes.
+  writeFileSync(at(file), up.bytes);
+  for (const f of readdirSync(at("vendor"))) {
+    if (/^cove-sdk-.*\.tgz$/.test(f) && f !== name) unlinkSync(at(`vendor/${f}`));
+  }
+  for (const [path, text] of writes) writeFileSync(at(path), text);
   return { file, from, to };
 }
 
 // ─── fetching and verifying ────────────────────────────────────────────────
 
-async function get(url: string, token?: string): Promise<Uint8Array> {
+export async function get(url: string, token?: string): Promise<Uint8Array> {
   const headers: Record<string, string> = {};
-  if (token) headers.authorization = `token ${token}`;
+  if (token) {
+    if (new URL(url).protocol !== "https:") {
+      throw new Error(`refusing to send FORGE_TOKEN to ${url}: not https`);
+    }
+    headers.authorization = `token ${token}`;
+  }
   // Never follow a redirect: it could carry the token elsewhere, and a login
   // page is not the asset.
   const res = await fetch(url, { headers, redirect: "manual" });
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error(
+      `GET ${url} answered ${res.status} (a redirect, not followed). ` +
+        "Download the files yourself and use --file with --sha256-sum.",
+    );
+  }
   if (res.status !== 200) throw new Error(`GET ${url} answered ${res.status}, expected 200`);
   return new Uint8Array(await res.arrayBuffer());
 }
@@ -291,6 +321,7 @@ async function main(): Promise<void> {
       bump: { type: "string", default: "patch" },
       "dry-run": { type: "boolean", default: false },
       "no-install": { type: "boolean", default: false },
+      root: { type: "string" },
       help: { type: "boolean", default: false },
     },
   });
@@ -358,7 +389,7 @@ async function main(): Promise<void> {
   console.log(`verified ${pkg.name}@${pkg.version} sha256 ${sha256(bytes)} (${source})`);
   if (values["dry-run"]) return;
 
-  const root = fileURLToPath(new URL("..", import.meta.url));
+  const root = values.root ? resolve(values.root) : fileURLToPath(new URL("..", import.meta.url));
   const up: Update = { bytes, source, bump: values.bump };
   if (tag !== undefined) up.tag = tag;
   const { file, from, to } = applyUpdate(root, up);

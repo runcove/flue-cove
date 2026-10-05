@@ -3,7 +3,7 @@
  * copy of this repository's files, which `check-vendor.mjs` then accepts.
  */
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
@@ -14,10 +14,13 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import {
   applyUpdate,
   artifactFrom,
@@ -142,6 +145,10 @@ describe("applyUpdate", () => {
       readFileSync(join(root, "examples/repo-agent/package-lock.json"), "utf8"),
       new RegExp(`"node_modules/flue-cove": \\{\\s*"version": "${to.replaceAll(".", "\\.")}"`),
     );
+    assert.match(
+      readFileSync(join(root, "examples/repo-agent/package-lock.json"), "utf8"),
+      /"node_modules\/flue-cove\/node_modules\/@cove\/sdk": \{\s*"version": "9\.8\.7"/,
+    );
     const changelog = readFileSync(join(root, "CHANGELOG.md"), "utf8");
     assert.ok(changelog.indexOf(`## [${to}]`) < changelog.indexOf(`## [${from}]`));
     assert.ok(changelog.includes(hash));
@@ -150,6 +157,45 @@ describe("applyUpdate", () => {
       encoding: "utf8",
     });
     assert.match(out, /OK/);
+  });
+
+  it("a repository not as expected is refused before anything is written", () => {
+    const root = repoCopy();
+    const readme = join(root, "vendor/README.md");
+    writeFileSync(readme, readFileSync(readme, "utf8").replace(/^\| Built with \|.*$/m, ""));
+    const snapshot = (): string[] =>
+      [
+        "package.json",
+        "README.md",
+        "CHANGELOG.md",
+        "scripts/check-vendor.mjs",
+        "vendor/README.md",
+        "examples/repo-agent/package-lock.json",
+      ].map((f) => readFileSync(join(root, f), "utf8"));
+    const before = snapshot();
+    const tarballs = readdirSync(join(root, "vendor"));
+    const bytes = fakeTarball({ name: "@cove/sdk", version: "9.8.6" }, "half.tgz");
+    assert.throws(
+      () => applyUpdate(root, { bytes, source: "x", bump: "patch" }),
+      /no "Built with" row/,
+    );
+    assert.deepEqual(snapshot(), before);
+    assert.deepEqual(readdirSync(join(root, "vendor")), tarballs);
+  });
+
+  it("puts the new section below an [Unreleased] section", () => {
+    const root = repoCopy();
+    const path = join(root, "CHANGELOG.md");
+    const text = readFileSync(path, "utf8");
+    const i = text.indexOf("\n## [");
+    writeFileSync(
+      path,
+      `${text.slice(0, i + 1)}## [Unreleased]\n\n- pending\n\n${text.slice(i + 1)}`,
+    );
+    const bytes = fakeTarball({ name: "@cove/sdk", version: "9.8.5" }, "unrel.tgz");
+    const { to } = applyUpdate(root, { bytes, source: "x", bump: "patch" });
+    const out = readFileSync(path, "utf8");
+    assert.ok(out.indexOf("## [Unreleased]") < out.indexOf(`## [${to}]`));
   });
 
   it("refuses a tarball that is not @cove/sdk, or the one already vendored", () => {
@@ -174,13 +220,17 @@ describe("the command", () => {
   fakeTarball({ name: "@cove/sdk", version: "9.8.7" }, "cmd.tgz");
 
   it("refuses a --file whose sha256 does not match, changing nothing", () => {
+    const root = repoCopy();
+    const before = readFileSync(join(root, "package.json"), "utf8");
     const res = spawnSync(
       process.execPath,
-      [script, "--file", tgz, "--expect-sha256", "0".repeat(64), "--dry-run"],
+      [script, "--root", root, "--no-install", "--file", tgz, "--expect-sha256", "0".repeat(64)],
       { encoding: "utf8" },
     );
     assert.equal(res.status, 1);
     assert.match(res.stderr, /sha256 mismatch/);
+    assert.equal(readFileSync(join(root, "package.json"), "utf8"), before);
+    assert.ok(existsSync(join(root, vendored())));
   });
 
   it("refuses an unverified --file", () => {
@@ -201,5 +251,96 @@ describe("the command", () => {
     );
     assert.equal(res.status, 0, res.stderr);
     assert.match(res.stdout, /verified @cove\/sdk@9\.8\.7/);
+  });
+});
+
+describe("the command over HTTP", () => {
+  const script = join(repo, "scripts/update-cove-sdk.ts");
+  const run = promisify(execFile);
+  const bytes = fakeTarball({ name: "@cove/sdk", version: "9.7.0" }, "served.tgz");
+  const hash = sha256(bytes);
+  let server: Server;
+  let base = "";
+  const seenAuth: string[] = [];
+
+  const start = () =>
+    new Promise<void>((done) => {
+      server = createServer((req, res) => {
+        seenAuth.push(req.headers.authorization ?? "");
+        const url = req.url ?? "";
+        if (url === "/public/sdk/index.json") {
+          res.setHeader("content-type", "application/json");
+          res.end(
+            JSON.stringify({
+              api_version: 6,
+              artifacts: [
+                {
+                  file: "cove-sdk-9.7.0.tgz",
+                  kind: "npm",
+                  package: "@cove/sdk",
+                  version: "9.7.0",
+                  sha256: hash,
+                  size: bytes.byteLength,
+                  url: "/public/sdk/cove-sdk-9.7.0.tgz",
+                },
+              ],
+            }),
+          );
+        } else if (url === "/public/sdk/cove-sdk-9.7.0.tgz") {
+          res.end(bytes);
+        } else if (url.startsWith("/redirect/")) {
+          res.statusCode = 302;
+          res.setHeader("location", "/public/sdk/cove-sdk-9.7.0.tgz");
+          res.end();
+        } else {
+          res.statusCode = 404;
+          res.end();
+        }
+      });
+      server.listen(0, "127.0.0.1", () => {
+        base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+        done();
+      });
+    });
+  before(start);
+  after(() => server?.close());
+
+  const attempt = async (args: string[], env: Record<string, string> = {}) => {
+    try {
+      const { stdout, stderr } = await run(process.execPath, [script, ...args], {
+        encoding: "utf8",
+        env: { ...process.env, ...env },
+      });
+      return { code: 0, stdout, stderr };
+    } catch (err) {
+      const e = err as { code?: number; stdout?: string; stderr?: string };
+      return { code: e.code ?? -1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+    }
+  };
+
+  it("--server verifies against index.json and vendors the tarball", async () => {
+    const root = repoCopy();
+    const res = await attempt(["--root", root, "--no-install", "--server", base]);
+    assert.equal(res.code, 0, res.stderr);
+    assert.ok(existsSync(join(root, "vendor/cove-sdk-9.7.0.tgz")));
+    assert.match(readFileSync(join(root, "scripts/check-vendor.mjs"), "utf8"), new RegExp(hash));
+  });
+
+  it("never follows a redirect", async () => {
+    const res = await attempt(["--dry-run", "--release", `${base}/redirect/cove-server-v9.7.0`]);
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /302 \(a redirect, not followed\)/);
+  });
+
+  it("refuses to send FORGE_TOKEN over plain http, and never prints it", async () => {
+    const token = "forge_token_unit_test_value";
+    seenAuth.length = 0;
+    const res = await attempt(["--dry-run", "--release", `${base}/rel/cove-server-v9.7.0`], {
+      FORGE_TOKEN: token,
+    });
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /not https/);
+    assert.ok(!`${res.stdout}${res.stderr}`.includes(token));
+    assert.ok(!seenAuth.some((a) => a.includes(token)), "the token never reached the server");
   });
 });

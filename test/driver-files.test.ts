@@ -658,6 +658,47 @@ describe("fallback rules, one per refusal", () => {
     }
   });
 
+  it("HEAD 403 scope_denied (X-Cove-Error-Code) is remembered: later reads skip the API", async () => {
+    const shell = localShellClient();
+    const fake = fsFiles({
+      stat: CoveAPIError.fromResponse(403, undefined, undefined, "scope_denied"),
+    });
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+    writeFileSync(join(dir, "f"), "abc");
+    assert.equal((await driver.stat(join(dir, "f"))).size, 3);
+    assert.equal(await driver.readFile(join(dir, "f")), "abc");
+    assert.deepEqual(fake.used, [`stat ${dir}/f`], "the read never tried the API");
+  });
+
+  it("a codeless HEAD 403 (older server) is not remembered: reads still use the API", async () => {
+    const shell = localShellClient();
+    const fake = fsFiles({ stat: apiError(403) });
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+    writeFileSync(join(dir, "f"), "abc");
+    assert.equal((await driver.stat(join(dir, "f"))).size, 3);
+    assert.equal(await driver.readFile(join(dir, "f")), "abc");
+    assert.ok(fake.used.includes(`download ${dir}/f`));
+  });
+
+  it("HEAD 409 invalid_state_transition (X-Cove-Error-Code) is SandboxDiedError, no exec", async () => {
+    const shell = localShellClient();
+    const fake = fsFiles({
+      stat: CoveAPIError.fromResponse(409, undefined, undefined, "invalid_state_transition"),
+    });
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+    await assert.rejects(driver.stat(join(dir, "f")), SandboxDiedError);
+    assert.equal(shell.calls.length, 0);
+  });
+
+  it("a codeless HEAD 409 (older server) falls back to exec as before", async () => {
+    const shell = localShellClient();
+    const fake = fsFiles({ stat: apiError(409) });
+    const driver = new CoveSandboxDriver(shell.client, "vm", { files: fake.files });
+    writeFileSync(join(dir, "f"), "abc");
+    assert.equal((await driver.stat(join(dir, "f"))).size, 3);
+    assert.ok(shell.calls.length > 0);
+  });
+
   it("HEAD 404 with no code (a server without X-Cove-Error-Code) reads as a missing file even if the VM is gone", async () => {
     // An older server's HEAD error has no body and no code header:
     // vm_not_found and file_not_found are both a bare 404. The route itself

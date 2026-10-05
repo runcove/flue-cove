@@ -355,13 +355,20 @@ describe("SDK errors as the driver sees them (fileErrorStatus)", () => {
           req.signal?.addEventListener("abort", () => reject(req.signal?.reason), { once: true });
         }),
     );
-    await assert.rejects(files.stat("vm", "/f", { timeoutMs: 20 }), (err: unknown) => {
-      assert.ok(err instanceof CoveTimeoutError, `got ${String(err)}`);
-      assert.ok(err instanceof CoveConnectionError);
-      assert.equal(isDeadline(err), true);
-      assert.equal(fileErrorStatus(err), undefined);
-      return true;
-    });
+    // The SDK's deadline timer is unref'd, and the mock fetch holds nothing
+    // open: keep the event loop alive until the deadline fires.
+    const keepAlive = setInterval(() => {}, 1000);
+    try {
+      await assert.rejects(files.stat("vm", "/f", { timeoutMs: 20 }), (err: unknown) => {
+        assert.ok(err instanceof CoveTimeoutError, `got ${String(err)}`);
+        assert.ok(err instanceof CoveConnectionError);
+        assert.equal(isDeadline(err), true);
+        assert.equal(fileErrorStatus(err), undefined);
+        return true;
+      });
+    } finally {
+      clearInterval(keepAlive);
+    }
   });
 
   it("the SDK does not retry a 429 itself (the driver does)", async () => {

@@ -43,5 +43,8 @@
     "@flue/runtime": "2.2.2",
     "@types/node": "22.20.4",
     "typescript": "5.9.3"
+  },
+  "overrides": {
+    "@modelcontextprotocol/client": "2.2.0"
   }
 }

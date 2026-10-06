@@ -5,7 +5,7 @@ Run [Flue](https://flueframework.com/) agents' sandboxed work on Cove microVMs.
 Flue agents do their shell and file work through a *sandbox*. `flue-cove` is a
 sandbox adapter that puts that work in a Cove VM: a full Linux machine per
 conversation, reached over the Cove API with the Cove TypeScript SDK
-(`@cove/sdk`).
+(`@runcove/sdk`).
 
 - `coveVms(options)` is a provisioning `SandboxFactory`. It finds or creates
   one VM per Flue instance id and deletes it when you call `release`.
@@ -13,8 +13,8 @@ conversation, reached over the Cove API with the Cove TypeScript SDK
   It never creates or deletes anything.
 - `CoveSandboxDriver` implements Flue's `SandboxDriver`, for custom wiring.
 - `fromEnv()` builds a `CoveClient` from environment variables.
-- `CoveClient` is re-exported from the bundled `@cove/sdk`. A client built
-  from another copy of the SDK works too: the adapter recognises its errors
+- `CoveClient` is re-exported from the `@runcove/sdk` the adapter depends on.
+  A client built from another copy of the SDK works too: the adapter recognises its errors
   by their HTTP `status` and API `code`, not by class.
 
 It implements Flue's [Sandbox Adapter API](https://flueframework.com/docs/reference/sandbox-api/)
@@ -22,10 +22,15 @@ It implements Flue's [Sandbox Adapter API](https://flueframework.com/docs/refere
 
 ## Install
 
-`@cove/sdk` is not on a public registry, so this repository vendors it
-(`vendor/cove-sdk-0.4.0.tgz`; see [vendor/README.md](vendor/README.md)).
-Install `flue-cove` from a clone or from a packed tarball, next to
-`@flue/runtime` (a peer dependency):
+Install `@runcove/flue` from npm, next to `@flue/runtime` (a peer
+dependency). It brings the Cove TypeScript SDK, `@runcove/sdk`, as a
+dependency:
+
+```sh
+npm install @runcove/flue @flue/runtime@2.2.2
+```
+
+To run an unreleased change, install it from a clone or from a packed tarball:
 
 ```sh
 # from a clone
@@ -33,12 +38,12 @@ git clone <this repository> flue-cove
 cd flue-cove && npm ci && npm run build
 cd ../my-flue-app && npm install --install-links ../flue-cove @flue/runtime@2.2.2
 
-# or from a tarball (the SDK is bundled inside it)
-cd flue-cove && npm pack            # → flue-cove-0.3.1.tgz
-cd ../my-flue-app && npm install ../flue-cove/flue-cove-0.3.1.tgz @flue/runtime@2.2.2
+# or from a tarball
+cd flue-cove && TGZ=$(npm pack | tail -n 1)    # its last line is the tarball's file name
+cd ../my-flue-app && npm install "../flue-cove/$TGZ" @flue/runtime@2.2.2
 ```
 
-Install a *copy*, never a symlink: a plain `npm install ../flue-cove` links
+From a clone, install a *copy*, never a symlink: a plain `npm install ../flue-cove` links
 the clone, and the adapter then loads the clone's own development copy of
 `@flue/runtime`. Its `SandboxDiedError` and `SandboxOperationUnsupportedError`
 are then not `instanceof` your app's `FlueError`, and Flue classifies sandbox
@@ -89,7 +94,7 @@ API for it. `initialSecrets` additionally needs secrets enabled on the server.
 
 ```ts
 // src/sandbox.ts — build the factory ONCE, at module scope
-import { coveVms } from "flue-cove";
+import { coveVms } from "@runcove/flue";
 
 export const vms = coveVms({
   cpus: 2,
@@ -122,7 +127,7 @@ await vms.releaseAll();
 To adapt a VM you manage yourself:
 
 ```ts
-import { cove, fromEnv } from "flue-cove";
+import { cove, fromEnv } from "@runcove/flue";
 useSandbox(cove(fromEnv(), "my-existing-vm", { cwd: "/workspace" }));
 ```
 
@@ -131,7 +136,7 @@ public repository into its VM, runs the tests and summarises them, plus the
 `release` script and a model-free smoke test. Its `smoke` and `release`
 scripts load `.env` the way `flue run` does; run `release` with the same
 `REPO_AGENT_TAGS` as the agent (or fewer), since the lookup matches every
-configured tag. The example installs `flue-cove` as a copy (`install-links`),
+configured tag. The example installs `@runcove/flue` as a copy (`install-links`),
 built by the root package's `prepare` script, which needs the root's dev
 dependencies: run `npm ci` at the repository root first, then `npm ci` in
 `examples/repo-agent`. Reinstall the example (`npm ci` there) after changing
@@ -312,9 +317,8 @@ is not configured").
 
 ```sh
 npm ci
-npm run check:vendor   # sha256 of the vendored SDK
 npm run lint           # biome
-npm run typecheck      # tsc --noEmit (src, test, scripts)
+npm run typecheck      # tsc --noEmit (src, test)
 npm test               # unit tests (node --test, TypeScript run directly by Node)
 npm run build          # tsc → dist/
 COVE_API_URL=https://<cove-host> COVE_API_KEY_FILE=~/.cove/api_key npm run test:integration
@@ -335,35 +339,13 @@ its code in `X-Cove-Error-Code`, which the SDK reads, and from an older one
 does not retry 429s; the driver does, using the `Retry-After` the SDK exposes
 as `retryAfterSecs`.
 
-### Moving to a released Cove SDK
-
-The vendored SDK is built from Cove's main branch until a Cove release
-carries one. Once it does, one command swaps it for the released tarball:
-
-```sh
-# from the release's assets (FORGE_TOKEN, if the repository is private)
-npm run update:cove-sdk -- --release https://<forge>/<owner>/cove/releases/download/<tag> \
-  --expect-sha256 <the release's cove_sdk_typescript_sha256 pin>
-# or from a Cove server that stages it (the server's public URL)
-npm run update:cove-sdk -- --server https://<cove-host>
-# or from a file already downloaded
-npm run update:cove-sdk -- --file cove-sdk-typescript.tgz --sha256-sum sha256.sum
-```
-
-It verifies the tarball's sha256 against the release's `sha256.sum` or the
-server's `/public/sdk/index.json` (and against `--expect-sha256` when given;
-it refuses an unverified file; it sends `FORGE_TOKEN` over https only and
-follows no redirect, so a forge that redirects its downloads needs `--file`),
-checks that it is `@cove/sdk`, checks every file it will edit, and only then
-vendors it as `vendor/cove-sdk-<version>.tgz`, removes the old tarball,
-updates `package.json`, `scripts/check-vendor.mjs`, `vendor/README.md`, this
-README and the example's lockfile, bumps flue-cove's version (`--bump
-patch`, the default, or `minor`), adds a CHANGELOG entry, runs `npm install`
-and `npm run check:vendor`. `--dry-run` only verifies. Then run the
-typecheck, lint, unit tests and the integration test, read the CHANGELOG
-entry, and commit.
-
 Changes, including breaking ones, are listed in [CHANGELOG.md](CHANGELOG.md).
+
+## Where it is developed
+
+The adapter is developed inside the Cove repository, as `integrations/flue`,
+where its checks run with Cove's own. This repository is its public copy,
+updated from there commit by commit.
 
 ## License
 

@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "@flue/runtime": "2.2.2",
-    "flue-cove": "file:../.."
+    "@runcove/flue": "file:../.."
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.87.1",

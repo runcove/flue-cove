@@ -10,8 +10,8 @@ import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { after, before, describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
-import type { CoveClient } from "@cove/sdk";
 import { type Sandbox, SandboxDiedError } from "@flue/runtime";
+import type { CoveClient } from "@runcove/sdk";
 import { CoveSandboxDriver, cove, coveVms, filesFor, fromEnv } from "../../src/index.ts";
 
 const enabled =
@@ -132,7 +132,7 @@ describe("Cove integration", {
       isSymbolicLink: false,
       size: big.length,
     });
-    const sum = (await sandbox.exec("sha256sum big.bin | cut -d' ' -f1")).stdout.trim();
+    const sum = (await sandbox.exec("sha256sum big.bin | awk '{print $1}'")).stdout.trim();
     const { createHash } = await import("node:crypto");
     assert.equal(sum, createHash("sha256").update(big).digest("hex"));
   });

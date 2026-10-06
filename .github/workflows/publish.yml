@@ -1,0 +1,164 @@
+name: Publish
+
+# Publishes a release of this repository to npm, as the file the release carries: nothing
+# is built here. Before anything reaches the registry, .github/scripts/verify-release.sh
+# checks that the release's sha256.sum is signed by the Cove release key and names its
+# source release, that the tarball matches its line in sha256.sum, and that the tarball is
+# this package at the release's version. npm trusts this workflow through trusted publishing
+# (OIDC), so no npm token is stored, and the package gets a provenance statement.
+#
+# Runs when a release is published, or by hand for an existing release:
+#   gh workflow run publish.yml --ref vX.Y.Z -f tag=vX.Y.Z
+# A version npm already has is skipped, green, with a notice.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (vX.Y.Z)
+        required: true
+        type: string
+
+# Nothing in this workflow writes to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify and publish to npm
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read # the checkout and the release download
+      id-token: write # trusted publishing: the OIDC token npm exchanges for a short-lived upload credential
+    env:
+      # The public half of the Cove release minisign key, the key `just publish` signs every
+      # release's sha256.sum with. Rotating it means changing it here and in every other
+      # public package repository's workflow.
+      MINISIGN_PUBKEY: RWTqA4R40UFRpbNGc8ZQiOg8HEXsVDqQgkMume81uaGP4hfF7LHcoUlF
+      # minisign 0.12 from github.com/jedisct1/minisign releases, checked by this sha256.
+      MINISIGN_VERSION: "0.12"
+      MINISIGN_SHA256: 9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
+      # Trusted publishing needs npm 11.5.1 or later.
+      NPM_VERSION: 11.21.0
+      PACKAGE_NAME: "@runcove/flue"
+      ASSET: cove-flue.tgz
+    steps:
+      - name: Resolve the release tag
+        id: tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RUN_REF: ${{ github.ref }}
+        run: |
+          tag="${RELEASE_TAG:-$INPUT_TAG}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::the release tag is not vX.Y.Z"
+            exit 1
+          fi
+          # The run must be on the release's own tag (a dispatch: "Use workflow from" = the tag),
+          # the ref the environment's v* deployment rule admits.
+          if [ "$RUN_REF" != "refs/tags/$tag" ]; then
+            echo "::error::this run is on $RUN_REF, not refs/tags/$tag; dispatch it from the tag"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # Only for .github/scripts/verify-release.sh: nothing from the checkout is built.
+      - name: Check out the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          persist-credentials: false
+
+      - name: Download the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/release" \
+            --pattern "$ASSET" --pattern sha256.sum --pattern sha256.sum.minisig
+
+      - name: Install minisign
+        run: |
+          mkdir -p "$RUNNER_TEMP/minisign" "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP/minisign"
+          curl -fsSL -o minisign.tar.gz \
+            "https://github.com/jedisct1/minisign/releases/download/${MINISIGN_VERSION}/minisign-${MINISIGN_VERSION}-linux.tar.gz"
+          echo "${MINISIGN_SHA256}  minisign.tar.gz" | sha256sum --strict -c -
+          tar -xzf minisign.tar.gz minisign-linux/x86_64/minisign
+          install -m 0755 minisign-linux/x86_64/minisign "$RUNNER_TEMP/bin/minisign"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Verify the release
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          bash .github/scripts/verify-release.sh --dir "$RUNNER_TEMP/release" --tag "$TAG" \
+            --asset "$ASSET" --registry npm --name "$PACKAGE_NAME" --pubkey "$MINISIGN_PUBKEY"
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      # An exact npm version, with no install scripts: the publishing client itself.
+      - name: Install npm
+        run: | # zizmor: ignore[adhoc-packages]
+          npm install -g --ignore-scripts "npm@${NPM_VERSION}"
+          test "$(npm --version)" = "$NPM_VERSION"
+
+      - name: Skip a version npm already has
+        id: registry
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        # Skip only when npm returns this version; publish only on E404 (no such package or
+        # version); any other answer (network, auth, registry error) fails the run.
+        run: |
+          version="${TAG#v}"
+          rc=0
+          out="$(npm view "${PACKAGE_NAME}@${version}" version --json 2>/dev/null)" || rc=$?
+          got="$(jq -r 'if type == "string" then . else empty end' <<<"$out" 2>/dev/null)" || got=""
+          if [ "$rc" -eq 0 ] && [ "$got" = "$version" ]; then
+            echo "::notice::${PACKAGE_NAME}@${version} is already on npm; nothing to publish"
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -ne 0 ] && [ "$(jq -r '.error.code? // empty' <<<"$out" 2>/dev/null)" = E404 ]; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::npm view ${PACKAGE_NAME}@${version} gave neither the version nor E404 (exit ${rc})"
+            exit 1
+          fi
+
+      # The tarball read by the code that publishes it: a dry run with the pinned npm names the
+      # package and version it would publish, which must be the pair verify-release.sh approved
+      # (the package name and the tag's version). Nothing is uploaded and no stored token is used;
+      # the two ACTIONS_ID_TOKEN_REQUEST_* variables are unset for the npm command (the runner
+      # re-injects them after a step's env:, so only `env -u` works) so the dry run does not
+      # exchange the job's OIDC token for a publish credential. npm 11 keys the JSON by name.
+      - name: Check what npm would publish
+        if: steps.registry.outputs.published != 'true'
+        working-directory: ${{ runner.temp }}/release
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          want="${TAG#v}"
+          out="$(env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN npm publish "./${ASSET}" --dry-run --json)"
+          got_name="$(jq -r 'if type == "object" and length == 1 then first(.[]).name // empty else empty end' <<<"$out")"
+          got_version="$(jq -r 'if type == "object" and length == 1 then first(.[]).version // empty else empty end' <<<"$out")"
+          if [ "$got_name" != "$PACKAGE_NAME" ] || [ "$got_version" != "$want" ]; then
+            echo "::error::npm would publish ${got_name}@${got_version}, not ${PACKAGE_NAME}@${want}"
+            exit 1
+          fi
+
+      - name: Publish to npm
+        if: steps.registry.outputs.published != 'true'
+        working-directory: ${{ runner.temp }}/release
+        run: npm publish "./${ASSET}" --provenance --access public

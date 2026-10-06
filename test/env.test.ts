@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { inspect } from "node:util";
-import { CoveClient, CoveConfigError, CoveTimeoutError } from "@cove/sdk";
+import { CoveClient, CoveConfigError, CoveTimeoutError } from "@runcove/sdk";
 import { createCoveClient, fromEnv } from "../src/client.ts";
 import { filesFor } from "../src/files.ts";
 
@@ -134,7 +134,7 @@ describe("createCoveClient", () => {
 });
 
 describe("package exports", () => {
-  it("re-exports the bundled SDK's CoveClient, so apps can build from the same copy", async () => {
+  it("re-exports the SDK's CoveClient, so apps can build from the same copy", async () => {
     const index = await import("../src/index.ts");
     assert.equal(index.CoveClient, CoveClient);
     assert.equal(index.CoveConfigError, CoveConfigError);

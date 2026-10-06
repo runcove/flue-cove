@@ -1,31 +1,31 @@
 /**
- * flue-cove bundles its own copy of `@cove/sdk`. An application may build its
- * `CoveClient` from another copy, whose error classes are different objects,
- * so `instanceof` against flue-cove's copy fails for every error it throws.
- * This builds a client from a second, separately extracted copy of the
- * vendored SDK and checks that the driver still classifies its errors.
+ * An application may build its `CoveClient` from another copy of
+ * `@runcove/sdk` than the one flue-cove imports (npm can install two), whose
+ * error classes are different objects, so `instanceof` against flue-cove's
+ * copy fails for every error it throws. This builds a client from a second,
+ * separately copied instance of the installed SDK and checks that the driver
+ * still classifies its errors.
  */
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
-import { CoveAPIError } from "@cove/sdk";
+import { CoveAPIError } from "@runcove/sdk";
 import { CoveSandboxDriver } from "../src/driver.ts";
 import { fileErrorStatus, filesFor } from "../src/files.ts";
 import { isRateLimited } from "../src/retry.ts";
 import { localShellClient } from "./helpers.ts";
 
-const tarball = readdirSync(resolve("vendor")).find((f) => f.endsWith(".tgz"));
+const installed = resolve("node_modules", "@runcove", "sdk");
 const tmp = mkdtempSync(join(tmpdir(), "flue-cove-sdk-copy-"));
 // biome-ignore lint/suspicious/noExplicitAny: a module loaded at run time
 let Other: any;
 
 before(async () => {
-  assert.ok(tarball, "no vendored SDK tarball");
-  execFileSync("tar", ["-xzf", resolve("vendor", tarball), "-C", tmp]);
+  assert.ok(existsSync(join(installed, "package.json")), "@runcove/sdk is not installed");
+  cpSync(installed, join(tmp, "package"), { recursive: true });
   Other = await import(pathToFileURL(join(tmp, "package", "dist", "index.js")).href);
 });
 after(() => rmSync(tmp, { recursive: true, force: true }));
@@ -45,7 +45,7 @@ function otherClient(respond: (url: URL, init?: RequestInit) => Response) {
   });
 }
 
-describe("a CoveClient from a second @cove/sdk copy", () => {
+describe("a CoveClient from a second @runcove/sdk copy", () => {
   it("is really a different copy", () => {
     assert.notEqual(Other.CoveAPIError, CoveAPIError);
     assert.ok(!(new Other.RateLimitError(429, "x") instanceof CoveAPIError));
@@ -102,7 +102,7 @@ describe("a CoveClient from a second @cove/sdk copy", () => {
 describe("isPlainCoveError", () => {
   it("is true only for the SDK's base CoveError, from either copy", async () => {
     const { isPlainCoveError } = await import("../src/errors.ts");
-    const sdk = await import("@cove/sdk");
+    const sdk = await import("@runcove/sdk");
     assert.equal(isPlainCoveError(new sdk.CoveError("no Content-Length")), true);
     assert.equal(isPlainCoveError(new Other.CoveError("no Content-Length")), true);
     assert.equal(isPlainCoveError(new sdk.CoveConnectionError("down")), false);

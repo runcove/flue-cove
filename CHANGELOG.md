@@ -10,8 +10,34 @@ All notable changes to `flue-cove`. The format follows
 
 - Licensed under Apache-2.0: `LICENSE` is the unmodified Apache License 2.0
   text, `package.json` declares `"license": "Apache-2.0"`, and `LICENSE` is
-  listed in `files`. The package stays `"private": true` until it is
-  published.
+  listed in `files`.
+- The package is named `@runcove/flue` (was `flue-cove`): import from
+  `"@runcove/flue"`, and the tarball `npm pack` writes is named after it
+  (the README's install steps take the name `npm pack` prints, so they no
+  longer name a version). `package.json` names the public repository it is published from. The
+  example depends on `@runcove/flue`. The adapter's behaviour, its stderr notes and its VM tags are
+  unchanged.
+- The adapter is developed in the Cove repository; this repository is its
+  public copy.
+- The package is no longer private: each signed release of it is published
+  to npm as `@runcove/flue` by this repository's
+  `.github/workflows/publish.yml`, which uploads the release's own tarball
+  after checking its signature, never a rebuild.
+- The Cove SDK is the published `@runcove/sdk` from npm (`^0.5.0`), an
+  ordinary dependency, in place of the vendored `@cove/sdk` 0.4.0 tarball
+  bundled inside the package. The package now carries only its own files.
+  `CoveClient`, re-exported from `@runcove/flue`, is `@runcove/sdk`'s: an
+  application that builds its own client imports it from `@runcove/sdk`
+  (a client from any other copy still works, as before). Between the two SDK
+  versions only documentation comments and one response type differ, so the
+  adapter's behaviour is unchanged. `vendor/`, `npm run check:vendor` and
+  `npm run update:cove-sdk` are gone.
+
+### Fixed
+
+- The test that a deadline shorter than the 429 backoff neither reports 124
+  nor kills the retry runs on mocked timers, so it no longer fails on a loaded
+  machine. A second test checks that the retry's own deadline still fires.
 
 ## [0.3.1]
 

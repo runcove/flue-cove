@@ -1,8 +1,11 @@
 {
-  "name": "flue-cove",
+  "name": "@runcove/flue",
   "version": "0.3.1",
-  "private": true,
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/runcove/flue-cove.git"
+  },
   "description": "Flue sandbox adapter backed by Cove microVMs",
   "type": "module",
   "engines": {
@@ -18,7 +21,6 @@
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
-    "vendor",
     "LICENSE"
   ],
   "scripts": {
@@ -28,23 +30,18 @@
     "format": "biome check --write .",
     "test": "node --test --test-reporter=spec --test-timeout=60000 \"test/*.test.ts\"",
     "test:integration": "node --test --test-reporter=spec --test-concurrency=1 \"test/integration/*.test.ts\"",
-    "check:vendor": "node scripts/check-vendor.mjs",
-    "update:cove-sdk": "node scripts/update-cove-sdk.ts",
     "prepare": "npm run build"
   },
   "peerDependencies": {
     "@flue/runtime": "^2.2.2"
   },
   "dependencies": {
-    "@cove/sdk": "file:vendor/cove-sdk-0.4.0.tgz"
+    "@runcove/sdk": "^0.5.0"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",
     "@flue/runtime": "2.2.2",
     "@types/node": "22.20.4",
     "typescript": "5.9.3"
-  },
-  "bundleDependencies": [
-    "@cove/sdk"
-  ]
+  }
 }

@@ -13,7 +13,7 @@ import {
   NotFoundError,
   PermissionDeniedError,
   RateLimitError,
-} from "@cove/sdk";
+} from "@runcove/sdk";
 import { isDeadline, retryAfterSecs } from "../src/errors.ts";
 import {
   DownloadTruncatedError,

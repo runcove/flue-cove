@@ -1,7 +1,7 @@
 /**
- * Classifying `@cove/sdk` errors by their shape, never with `instanceof`.
+ * Classifying `@runcove/sdk` errors by their shape, never with `instanceof`.
  *
- * flue-cove bundles its own copy of the SDK. An application that builds its
+ * flue-cove imports its own copy of the SDK. An application that builds its
  * `CoveClient` from another copy (its own install, a different version)
  * throws error objects whose classes are not flue-cove's, so `instanceof
  * CoveAPIError` would be false for every one of them, and a refusal the
@@ -43,7 +43,7 @@ export function isPlainCoveError(err: unknown): boolean {
 }
 
 /**
- * True when a request's deadline expired. `@cove/sdk` raises its `timeoutMs`
+ * True when a request's deadline expired. `@runcove/sdk` raises its `timeoutMs`
  * deadline as `CoveTimeoutError`; an older copy let the platform's
  * `DOMException` named `TimeoutError` through instead, as does a caller's own
  * `AbortSignal.timeout()`. Recognised by name, from any copy of the SDK.

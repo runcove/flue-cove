@@ -14,7 +14,6 @@
  * so spaces, quotes, newlines and leading dashes all survive.
  */
 import { randomUUID } from "node:crypto";
-import type { CoveClient, ExecEvent, InjectSelector } from "@cove/sdk";
 import {
   type FileStat,
   SandboxDiedError,
@@ -22,6 +21,7 @@ import {
   SandboxOperationUnsupportedError,
   type ShellResult,
 } from "@flue/runtime";
+import type { CoveClient, ExecEvent, InjectSelector } from "@runcove/sdk";
 import { apiErrorStatus, isDeadline, isPlainCoveError } from "./errors.ts";
 import { type CoveFiles, fileErrorStatus } from "./files.ts";
 import { buildScript } from "./quote.ts";

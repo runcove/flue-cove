@@ -8,7 +8,7 @@
  * Configuration comes from the environment (see the README): COVE_API_URL plus
  * COVE_API_KEY or COVE_API_KEY_FILE.
  */
-import { coveVms } from "flue-cove";
+import { coveVms } from "@runcove/flue";
 
 export const repoVms = coveVms({
   cpus: 2,

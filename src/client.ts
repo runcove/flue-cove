@@ -4,7 +4,7 @@
  * `files.ts` adapts it for the driver.
  */
 import { readFileSync } from "node:fs";
-import { CoveClient, type CoveClientOptions, CoveConfigError } from "@cove/sdk";
+import { CoveClient, type CoveClientOptions, CoveConfigError } from "@runcove/sdk";
 
 /** `new CoveClient(options)`. */
 export function createCoveClient(options: CoveClientOptions): CoveClient {
@@ -22,7 +22,7 @@ export type FromEnvOptions = Omit<CoveClientOptions, "baseUrl" | "token" | "tick
  *
  * A missing or unreadable setting, and anything the SDK's constructor refuses
  * (a malformed or non-`http(s)` URL, plain `http://` to a non-loopback host),
- * throws the bundled SDK's `CoveConfigError`. The key never appears in an
+ * throws the SDK's `CoveConfigError`. The key never appears in an
  * error, a log line or a serialized client.
  */
 export function fromEnv(

@@ -21,15 +21,14 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: npm run check:vendor
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
-      # The example installs flue-cove as a copy, built by the root's prepare
-      # script, so it needs the root's dev dependencies installed first.
+      # The example installs @runcove/flue as a copy of the root, which the
+      # build above has already compiled, so its install runs no scripts.
       # Typecheck only: no Cove server or model credentials are involved.
-      - run: npm ci
+      - run: npm ci --ignore-scripts
         working-directory: examples/repo-agent
       - run: npm run typecheck
         working-directory: examples/repo-agent

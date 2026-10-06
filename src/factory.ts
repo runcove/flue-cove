@@ -7,8 +7,9 @@
  *   Flue instance id and deletes it when the application calls `release`.
  *   Flue itself never tears a sandbox down; cleanup is the application's job.
  */
-import type { CoveClient, CoveClientOptions, SecretSpec, VmState, VmSummary } from "@cove/sdk";
+
 import { type Sandbox, type SandboxFactory, sandboxFromDriver } from "@flue/runtime";
+import type { CoveClient, CoveClientOptions, SecretSpec, VmState, VmSummary } from "@runcove/sdk";
 import { createCoveClient, fromEnv } from "./client.ts";
 import { type CoveDriverOptions, type CoveExecClient, CoveSandboxDriver } from "./driver.ts";
 import { apiErrorStatus } from "./errors.ts";

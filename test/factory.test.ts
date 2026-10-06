@@ -13,7 +13,7 @@ import {
   RateLimitError,
   type VmState,
   type VmSummary,
-} from "@cove/sdk";
+} from "@runcove/sdk";
 import { type CoveProvisioningClient, cove, coveVms } from "../src/factory.ts";
 import type { CoveFiles } from "../src/files.ts";
 
@@ -563,7 +563,7 @@ describe("cove(): the pure adapter", () => {
   });
 });
 
-describe("errors from another @cove/sdk copy (classified by shape)", () => {
+describe("errors from another @runcove/sdk copy (classified by shape)", () => {
   /** An API error that is not an instance of this package's SDK classes. */
   const foreign = (status: number, code: string) =>
     Object.assign(new Error(`HTTP ${status}: ${code}`), { name: "ConflictError", status, code });

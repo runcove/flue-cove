@@ -2,7 +2,7 @@
  * Retrying calls that Cove refused with 429. The API rate-limits each source
  * address (a token bucket, 30 requests/s by default) and rejects the excess
  * before any handler runs, so a 429'd request did nothing and is safe to
- * resend, a POST included. `@cove/sdk` never retries a 429 itself (its file
+ * resend, a POST included. `@runcove/sdk` never retries a 429 itself (its file
  * methods included), so the retry lives here. The SDK exposes the answer's
  * `Retry-After` as `retryAfterSecs`: when present it sets the
  * wait (capped), otherwise the wait is a short exponential backoff with jitter.

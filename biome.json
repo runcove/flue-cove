@@ -5,7 +5,6 @@
       "**",
       "!**/node_modules",
       "!**/dist",
-      "!vendor",
       "!**/package-lock.json",
       "!examples/repo-agent/.flue"
     ]

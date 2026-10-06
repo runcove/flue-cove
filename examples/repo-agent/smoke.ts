@@ -23,7 +23,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { FlueError, init, SandboxDiedError, SandboxOperationUnsupportedError } from "@flue/runtime";
 import { start } from "@flue/runtime/node";
-import { CoveSandboxDriver } from "flue-cove";
+import { CoveSandboxDriver } from "@runcove/flue";
 import { RepoAgent } from "./src/agents/repo-agent.ts";
 import { repoVms } from "./src/sandbox.ts";
 

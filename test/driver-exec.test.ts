@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
-import { ConflictError, CoveTimeoutError, NotFoundError, RateLimitError } from "@cove/sdk";
 import { SandboxDiedError, sandboxFromDriver } from "@flue/runtime";
+import { ConflictError, CoveTimeoutError, NotFoundError, RateLimitError } from "@runcove/sdk";
 import {
   type CoveExecClient,
   CoveSandboxDriver,
@@ -412,24 +412,93 @@ describe("the group-kill helper", { skip: !LINUX && "needs /proc and setsid" }, 
 });
 
 describe("exec: secrets timers", () => {
-  it("a deadline shorter than the 429 backoff neither reports 124 nor kills the retry", async () => {
-    const shell = localShellClient();
+  /**
+   * A secrets exec whose first attempt is refused with 429 and whose second
+   * attempt answers only when the test says so. Kills (the driver's
+   * `KILL_GROUP` helper, which goes over plain exec) are recorded, not run.
+   * Driven by mocked timers and a zero jitter, so the schedule is exact and
+   * no wall-clock time is measured.
+   */
+  function rateLimitedOnce() {
     let attempts = 0;
+    const kills: string[][] = [];
+    let answer: ((out: { stdout: string; stderr: string; exit_code: number }) => void) | undefined;
     const client = {
       vms: {
-        exec: shell.client.vms.exec,
-        execWithSecrets: async (vm: string, opts: { command: string[] }) => {
+        exec: async function* (_vm: string, opts: { command: string[] }) {
+          kills.push(opts.command);
+          yield { kind: "exit", code: 0 };
+        },
+        execWithSecrets: async () => {
           if (++attempts === 1) throw new RateLimitError(429, "HTTP 429: Too Many Requests");
-          return shell.client.vms.execWithSecrets(vm, { ...opts, selector: { kind: "all" } });
+          return new Promise((r) => {
+            answer = r;
+          });
         },
       },
     } as unknown as CoveExecClient;
-    const driver = new CoveSandboxDriver(client, "vm", { secrets: { kind: "all" } });
-    // The first attempt's 200 ms timer would fire during the >= 250 ms backoff
-    // and its kill would find the retry's pid file.
-    const res = await driver.exec("sleep 0.1; echo ok", { timeoutMs: 200 });
-    assert.equal(attempts, 2);
-    assert.deepEqual(res, { stdout: "ok\n", stderr: "", exitCode: 0 });
+    return {
+      driver: new CoveSandboxDriver(client, "vm", { secrets: { kind: "all" } }),
+      attempts: () => attempts,
+      kills,
+      answer: (out: { stdout: string; stderr: string; exit_code: number }) => {
+        assert.ok(answer, "the retry has not been sent");
+        answer(out);
+      },
+    };
+  }
+
+  /** Let every pending promise continuation run (setImmediate is not mocked). */
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+  };
+
+  it("a deadline shorter than the 429 backoff neither reports 124 nor kills the retry", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    t.mock.method(Math, "random", () => 0); // the backoff is exactly 250 ms
+    const fake = rateLimitedOnce();
+    const res = fake.driver.exec("echo ok", { timeoutMs: 200 });
+    await settle();
+    assert.equal(fake.attempts(), 1);
+    // The backoff: 249 ms in, the first attempt's 200 ms timer, had it
+    // survived the 429, would have fired and killed (and found the retry's
+    // pid file).
+    t.mock.timers.tick(249);
+    await settle();
+    assert.equal(fake.attempts(), 1);
+    assert.deepEqual(fake.kills, []);
+    t.mock.timers.tick(1);
+    await settle();
+    assert.equal(fake.attempts(), 2);
+    // The retry gets its own 200 ms: 199 ms into it (449 ms after the first
+    // request) it answers, with no kill and no 124.
+    t.mock.timers.tick(199);
+    await settle();
+    fake.answer({ stdout: "ok\n", stderr: "", exit_code: 0 });
+    assert.deepEqual(await res, { stdout: "ok\n", stderr: "", exitCode: 0 });
+    assert.deepEqual(fake.kills, []);
+  });
+
+  it("the retry's own deadline still fires, 200 ms after the retry went out", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    t.mock.method(Math, "random", () => 0);
+    const fake = rateLimitedOnce();
+    const res = fake.driver.exec("sleep 9", { timeoutMs: 200 });
+    await settle();
+    t.mock.timers.tick(250);
+    await settle();
+    assert.equal(fake.attempts(), 2);
+    t.mock.timers.tick(199);
+    await settle();
+    assert.deepEqual(fake.kills, []);
+    t.mock.timers.tick(1);
+    await settle();
+    assert.equal(fake.kills.length, 1);
+    assert.equal(fake.kills[0]?.[2], KILL_GROUP);
+    fake.answer({ stdout: "", stderr: "", exit_code: 137 });
+    const out = await res;
+    assert.equal(out.exitCode, 124);
+    assert.match(out.stderr, /command timed out after 200ms/);
   });
 
   it("a timeoutMs beyond setTimeout's range does not fire at once", async () => {

@@ -17,7 +17,7 @@ import {
   type ExecOptions,
   type ExecOutputDto,
   type ExecWithSecretsOptions,
-} from "@cove/sdk";
+} from "@runcove/sdk";
 import type { CoveExecClient } from "../src/driver.ts";
 
 export interface ExecCall {
@@ -193,7 +193,7 @@ const HEAD_IMPLIED_CODES: Record<number, string> = {
 };
 
 /**
- * The error `@cove/sdk` throws for an HTTP refusal, built by the SDK's own
+ * The error `@runcove/sdk` throws for an HTTP refusal, built by the SDK's own
  * mapping (`CoveAPIError.fromResponse`): `code` set means a JSON error body
  * (GET/PUT); omitted, a body-less HEAD answer, as `stat` sees it, which gets
  * the code the SDK implies for 413, 422 and 503 and none otherwise.

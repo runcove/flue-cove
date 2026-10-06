@@ -2,7 +2,7 @@
  * Cove's file-transfer API (`/api/vms/{name}/files`: HEAD `statVmFile`, GET
  * `downloadVmFile`, PUT `uploadVmFile`) behind one small interface.
  *
- * The transfer itself is `@cove/sdk`'s `client.vms.files`. {@link CoveFiles}
+ * The transfer itself is `@runcove/sdk`'s `client.vms.files`. {@link CoveFiles}
  * is the slice of it the driver uses, kept as a seam so driver tests can hand
  * in a fake; {@link sdkFiles} adapts the SDK resource to it. The driver
  * classifies failures only through {@link fileErrorStatus}, which reads the
@@ -14,7 +14,7 @@ import type {
   VmFileDownload,
   VmFileStat,
   VmFilesResource,
-} from "@cove/sdk";
+} from "@runcove/sdk";
 import { apiErrorStatus } from "./errors.ts";
 
 export {
@@ -24,7 +24,7 @@ export {
   FileTooLargeError,
   UnavailableError,
   VmFileNotFoundError,
-} from "@cove/sdk";
+} from "@runcove/sdk";
 
 /**
  * `stat`: what a HEAD tells us about a regular file: its size, mode and

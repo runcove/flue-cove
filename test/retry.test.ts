@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { CoveAPIError, RateLimitError, ServerError } from "@cove/sdk";
+import { CoveAPIError, RateLimitError, ServerError } from "@runcove/sdk";
 import { CoveSandboxDriver } from "../src/driver.ts";
 import type { CoveFiles } from "../src/files.ts";
 import {

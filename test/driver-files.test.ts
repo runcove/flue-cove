@@ -13,12 +13,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, beforeEach, describe, it } from "node:test";
-import { CoveAPIError, CoveClient, CoveConnectionError } from "@cove/sdk";
 import {
   SandboxDiedError,
   SandboxOperationUnsupportedError,
   sandboxFromDriver,
 } from "@flue/runtime";
+import { CoveAPIError, CoveClient, CoveConnectionError } from "@runcove/sdk";
 import { CoveSandboxDriver } from "../src/driver.ts";
 import {
   type CoveFiles,

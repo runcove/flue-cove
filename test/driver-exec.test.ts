@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -10,6 +10,7 @@ import { ConflictError, CoveTimeoutError, NotFoundError, RateLimitError } from "
 import {
   type CoveExecClient,
   CoveSandboxDriver,
+  INNER,
   KILL_GROUP,
   timeoutSecsFor,
 } from "../src/driver.ts";
@@ -384,21 +385,90 @@ describe("the group-kill helper", { skip: !LINUX && "needs /proc and setsid" }, 
     }
   });
 
-  it("waits briefly for a pid file that does not exist yet", async () => {
+  it("stops a command that starts after the kill, before it runs anything", async () => {
+    // However late the command starts, it finds the kill's marker and exits:
+    // nothing the kill does waits a fixed time for the pid file.
     const pidFile = join(dir, "late.pid");
-    const victim = spawn("sleep", ["30"], { stdio: "ignore" });
+    const marker = join(dir, "late.ran");
+    assert.equal(await run(KILL_GROUP, pidFile), 0);
+    assert.equal(await run(INNER, pidFile, `touch '${marker}'`, "p"), 125);
+    assert.equal(existsSync(marker), false, "the user command ran after the kill");
+    assert.equal(existsSync(pidFile), false);
+    assert.equal(existsSync(`${pidFile}.kill`), false);
+  });
+
+  it("a command that started first is killed, and the kill cleans up after itself", async () => {
+    const pidFile = join(dir, "early.pid");
+    const victim = spawn("sh", ["-c", INNER, "sh", pidFile, "sleep 30", "p"], { stdio: "ignore" });
     const closed = new Promise((r) => victim.on("close", r));
     try {
-      await sleep(50);
-      setTimeout(
-        () => writeFileSync(pidFile, `p ${victim.pid} ${starttime(victim.pid as number)}`),
-        300,
+      await eventually(
+        `${pidFile} written`,
+        () => existsSync(pidFile) && /\d/.test(readFileSync(pidFile, "utf8")),
       );
-      await run(KILL_GROUP, pidFile);
+      assert.equal(await run(KILL_GROUP, pidFile), 0);
       await closed;
       assert.equal(goneOrZombie(victim.pid as number), true);
+      assert.equal(existsSync(pidFile), false);
+      assert.equal(existsSync(`${pidFile}.kill`), false);
     } finally {
       killQuietly(victim.pid);
+    }
+  });
+
+  it("kills a group whose leader is gone though its start time was recorded", async () => {
+    // Pins the rule, not the race: a recorded start time that can no longer be
+    // read means the leader is gone, not that its pid was recycled.
+    const pidFile = join(dir, "gone.pid");
+    const memberFile = join(dir, "gone.member");
+    const leader = spawn(
+      "setsid",
+      [
+        "sh",
+        "-c",
+        `sleep 30 & echo $! > '${memberFile}'; ` +
+          `echo "g $$ $(sed 's/^.*) //' /proc/$$/stat | cut -d' ' -f20)" > '${pidFile}'; exit 0`,
+      ],
+      { stdio: "ignore" },
+    );
+    await new Promise((r) => leader.on("close", r));
+    const member = Number(readFileSync(memberFile, "utf8").trim());
+    try {
+      assert.equal(goneOrZombie(member), false, "the member should be running before the kill");
+      assert.equal(await run(KILL_GROUP, pidFile), 0);
+      await eventually("the group killed", () => goneOrZombie(member));
+    } finally {
+      killQuietly(member);
+    }
+  });
+
+  it("still kills the group when the marker cannot be created", {
+    skip: process.getuid?.() === 0 && "root can write to a read-only directory",
+  }, async () => {
+    // A full /tmp or a read-only one: the kill must not stop at the marker.
+    const roDir = mkdtempSync(join(dir, "ro-"));
+    const pidFile = join(roDir, "ro.pid");
+    const memberFile = join(dir, "ro.member");
+    const leader = spawn(
+      "setsid",
+      [
+        "sh",
+        "-c",
+        `sleep 30 & echo $! > '${memberFile}'; ` +
+          `echo "g $$ $(sed 's/^.*) //' /proc/$$/stat | cut -d' ' -f20)" > '${pidFile}'; exit 0`,
+      ],
+      { stdio: "ignore" },
+    );
+    await new Promise((r) => leader.on("close", r));
+    const member = Number(readFileSync(memberFile, "utf8").trim());
+    chmodSync(roDir, 0o555);
+    try {
+      assert.equal(goneOrZombie(member), false, "the member should be running before the kill");
+      assert.equal(await run(KILL_GROUP, pidFile), 0);
+      await eventually("the group killed", () => goneOrZombie(member));
+    } finally {
+      chmodSync(roDir, 0o755);
+      killQuietly(member);
     }
   });
 

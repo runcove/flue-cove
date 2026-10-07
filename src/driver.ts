@@ -105,35 +105,49 @@ const WRITE_CHUNK_BYTES = 64 * 1024;
  * leader of a new process group (`setsid -w`) when the guest has setsid,
  * recording `<mode> <pid> <starttime>` in a pid file so the command can be
  * killed later: mode `g` means the pid is a process-group id, `p` a lone pid.
- * Cove's own timeout kills only the direct child and an aborted request kills
- * nothing; the group kill is what makes
- * `timeoutMs` and abort actually stop the command.
+ * Cove's own timeout stops at most the launcher (the direct child, or the
+ * process group the command was started in, which setsid leaves) and an
+ * aborted request kills nothing; the group kill is what makes `timeoutMs` and
+ * abort actually stop the command.
  * `$1` = inner script, `$2` = pid file, `$3` = user script.
  */
 const LAUNCH =
   "if command -v bash >/dev/null 2>&1; then s=bash; else s=sh; fi; " +
   'if setsid -w true 2>/dev/null; then exec setsid -w "$s" -c "$1" "$s" "$2" "$3" g; ' +
   'else exec "$s" -c "$1" "$s" "$2" "$3" p; fi';
-const INNER =
+export const INNER =
   "__flue_cove_pidfile=$1; __flue_cove_cmd=$2; __flue_cove_mode=$3; shift 3; " +
   "{ __flue_cove_st=$(sed 's/^.*) //' /proc/$$/stat | cut -d' ' -f20); " +
   'echo "$__flue_cove_mode $$ $__flue_cove_st" > "$__flue_cove_pidfile"; } 2>/dev/null; ' +
+  'if [ -e "$__flue_cove_pidfile.kill" ]; then ' +
+  'rm -f -- "$__flue_cove_pidfile" "$__flue_cove_pidfile.kill"; exit 125; fi; ' +
   "trap 'rm -f -- \"$__flue_cove_pidfile\"' EXIT; " +
   'eval "$__flue_cove_cmd"';
 /**
- * Kill what pid file `$1` records, then drop the file. Waits up to ~1 s for
- * the file (an abort can race the command's start). A recorded pid that is
- * alive but has a different start time is a recycled pid: leave it alone. A
- * group id whose leader is gone is still safe to signal: the kernel does not
- * hand out a pid that is still in use as a process-group id.
+ * Kill what pid file `$1` records, then drop the file.
+ *
+ * A command can still be starting when the kill comes (an abort right after
+ * the request, or a timeout that stopped only the launcher), so neither side
+ * waits on the other: the kill first leaves a `$1.kill` marker, then reads
+ * the pid file, while the command writes its pid file, then looks for the
+ * marker. Whichever runs second sees the other's write, so either the kill
+ * finds a pid or the command finds the marker and exits before running
+ * anything. A marker nobody reads is left behind, empty. The marker is
+ * created with `true`, not `:`: a failed redirection on a special built-in
+ * ends a POSIX shell, and the kill must go on when `/tmp` is full.
+ *
+ * The leader's start time is read once: a pid that is alive with a
+ * different start time is a recycled pid, so leave it alone; no start time
+ * means the leader is gone, possibly in the instant since the pid file was
+ * read. A group id whose leader is gone is still safe to signal: the kernel
+ * does not hand out a pid that is still in use as a process-group id.
  */
 export const KILL_GROUP =
-  'i=0; while [ ! -e "$1" ] && [ "$i" -lt 5 ]; do sleep 0.2; i=$((i+1)); done; ' +
-  'read -r m p t < "$1" 2>/dev/null; rm -f -- "$1"; ' +
-  'case $p in ""|*[!0-9]*) exit 0;; esac; [ "$p" -gt 1 ] || exit 0; ' +
-  'if [ -r "/proc/$p/stat" ]; then ' +
-  "cur=$(sed 's/^.*) //' \"/proc/$p/stat\" | cut -d' ' -f20); " +
-  '[ -z "$t" ] || [ "$cur" = "$t" ] || exit 0; ' +
+  'true > "$1.kill" 2>/dev/null; read -r m p t < "$1" 2>/dev/null; ' +
+  'case $p in ""|*[!0-9]*) exit 0;; esac; ' +
+  'trap \'rm -f -- "$1" "$1.kill"\' EXIT; [ "$p" -gt 1 ] || exit 0; ' +
+  "cur=$(sed 's/^.*) //' \"/proc/$p/stat\" 2>/dev/null | cut -d' ' -f20); " +
+  'if [ -n "$cur" ]; then [ -z "$t" ] || [ "$cur" = "$t" ] || exit 0; ' +
   'elif [ "$m" != g ]; then exit 0; fi; ' +
   'if [ "$m" = g ]; then kill -s KILL -- "-$p" 2>/dev/null; else kill -s KILL "$p" 2>/dev/null; fi; exit 0';
 

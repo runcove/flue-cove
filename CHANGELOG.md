@@ -35,6 +35,16 @@ All notable changes to `flue-cove`. The format follows
 
 ### Fixed
 
+- A command that timed out or was aborted could be left running with
+  everything it started in the background. The group kill checked that the
+  command's leader process was still alive and then read its start time; when
+  the leader exited between those two steps, the kill took the missing start
+  time for a recycled pid and signalled nothing. It now reads the start time
+  once, and a leader that is gone no longer stops the group from being killed.
+  The kill also no longer gives up after waiting about a second for a command
+  that is still starting: it leaves a marker that the command checks once it
+  has recorded its pid, so a command that starts after the kill exits (125)
+  before running anything, however late it starts.
 - The test that a deadline shorter than the 429 backoff neither reports 124
   nor kills the retry runs on mocked timers, so it no longer fails on a loaded
   machine. A second test checks that the retry's own deadline still fires.

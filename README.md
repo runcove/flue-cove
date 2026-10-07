@@ -266,10 +266,10 @@ These were measured against a Cove server built after 0.33.2 that includes the f
   stream) and then kills the command's process group with a second exec. Flue
   rejects the caller with `AbortError` at once, as its contract requires; the
   kill lands a few hundred milliseconds later. Without `setsid` in the guest
-  only the top process is killed. Residual window: the kill waits up to about
-  a second for the command to record its pid; a command that starts later
-  than that (the abort raced the request itself) is not killed. A recorded
-  pid that has since been reused by another process is left alone.
+  only the top process is killed. A command that has not recorded its pid
+  yet when the kill lands (the abort raced the request itself) exits without
+  running anything once it starts. A recorded pid that has since been reused
+  by another process is left alone.
 - **Non-UTF-8 output.** If a command writes bytes that are not valid UTF-8,
   Cove drops that command's output (and the command may then die of
   `SIGPIPE`). The adapter's own transfers use base64, so file content is safe;

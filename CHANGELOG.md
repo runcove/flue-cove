@@ -6,6 +6,8 @@ All notable changes to `flue-cove`. The format follows
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-07
+
 ### Changed
 
 - Licensed under Apache-2.0: `LICENSE` is the unmodified Apache License 2.0

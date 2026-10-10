@@ -369,18 +369,21 @@ export function coveVms(options: CoveVmsOptions = {}): CoveVmsFactory {
   }
 
   /**
-   * Cove applies `initial_tags` after the create succeeds, best effort: a
-   * tag that fails is only logged server-side. Without its tags a VM is
+   * A current Cove server writes `initial_tags` before the VM first reads as
+   * `running`, all of them or none (a create whose tags cannot be written
+   * fails and the VM is removed). An older server applied them after the
+   * create, best effort, logging a tag that failed. Without its tags a VM is
    * invisible to reuse and to `release` from another process, so check them
-   * and set any that are missing (needs `tags:write`).
+   * and set any that are missing (needs `tags:write`): against a current
+   * server this finds nothing to do.
    */
   async function ensureTags(name: string, wanted: Record<string, string>): Promise<void> {
     const c = getClient();
     const missing = (have: Record<string, string>) =>
       Object.entries(wanted).some(([k, v]) => have[k] !== v);
-    // cove-server applies initial_tags only after the whole create finishes,
-    // which is after the VM already reports running (about 0.1-0.2 s later
-    // on a dev server). Give the server the grace period before stepping in.
+    // An older cove-server applied initial_tags only after the whole create
+    // finished, after the VM already reported running (about 0.1-0.2 s later
+    // on a dev server). Give it the grace period before stepping in.
     const deadline = Date.now() + tagGraceMs;
     let have = (await rl(() => c.vms.get(name))).tags ?? {};
     while (missing(have) && Date.now() < deadline) {

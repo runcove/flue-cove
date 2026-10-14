@@ -251,6 +251,16 @@ function canFallBack(
   }
 }
 
+/** A fresh pid file path, one per launch attempt. */
+function newPidFile(): string {
+  return `/tmp/.flue-cove-${randomUUID()}.pid`;
+}
+
+/** The argv that launches `script` under {@link LAUNCH}, recording its pid in `pidFile`. */
+function launchArgv(script: string, pidFile: string): string[] {
+  return ["sh", "-c", LAUNCH, "sh", INNER, pidFile, script];
+}
+
 interface RunResult {
   stdout: string;
   stderr: string;
@@ -305,10 +315,9 @@ export class CoveSandboxDriver implements SandboxDriver {
       ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
       ...(options.env !== undefined ? { env: options.env } : {}),
     });
-    const pidFile = `/tmp/.flue-cove-${randomUUID()}.pid`;
-    const argv = ["sh", "-c", LAUNCH, "sh", INNER, pidFile, script];
-    if (this.#secrets) return this.#execWithSecrets(argv, pidFile, options);
-    return this.#execStreaming(argv, pidFile, options);
+    if (this.#secrets) return this.#execWithSecrets(script, options);
+    const pidFile = newPidFile();
+    return this.#execStreaming(launchArgv(script, pidFile), pidFile, options);
   }
 
   async #execStreaming(
@@ -362,11 +371,12 @@ export class CoveSandboxDriver implements SandboxDriver {
     }
   }
 
-  async #execWithSecrets(
-    argv: string[],
-    pidFile: string,
-    options: ExecOptions,
-  ): Promise<ShellResult> {
+  async #execWithSecrets(script: string, options: ExecOptions): Promise<ShellResult> {
+    // Each attempt gets its own pid file: a deadline kill aimed at one attempt
+    // leaves a `.kill` marker beside its pid file, which a retry sharing the
+    // file would find and exit 125 on, having run nothing.
+    // Set by the first attempt, before anything that can fail reads it.
+    let pidFile!: string;
     const selector = this.#secrets as InjectSelector;
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -382,21 +392,27 @@ export class CoveSandboxDriver implements SandboxDriver {
           // nothing, so its timer must not survive into the backoff and fire
           // a kill that would find the retry's pid file.
           timedOut = false;
+          const attemptPidFile = newPidFile();
+          pidFile = attemptPidFile;
           if (delay !== undefined) {
             timer = setTimeout(() => {
               timedOut = true;
-              void this.#killGroup(pidFile);
+              void this.#killGroup(attemptPidFile);
             }, delay);
           }
           try {
             return await this.#client.vms.execWithSecrets(
               this.#vm,
-              { command: argv, selector },
+              { command: launchArgv(script, attemptPidFile), selector },
               options.signal ? { signal: options.signal } : {},
             );
           } catch (err) {
             if (isRateLimited(err)) {
               clearTimeout(timer);
+              // The deadline passed while this attempt was waiting for its
+              // answer: the refused attempt ran nothing, and a retry would
+              // start a command already out of time. Report the timeout.
+              if (timedOut) return { stdout: "", stderr: "", exit_code: 124 };
               timedOut = false;
             }
             throw err;

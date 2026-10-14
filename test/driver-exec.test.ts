@@ -549,6 +549,98 @@ describe("exec: secrets timers", () => {
     assert.deepEqual(fake.kills, []);
   });
 
+  /**
+   * A secrets exec whose attempts are all answered by the test, in order:
+   * each call to `execWithSecrets` waits for `reply(n)`. Records the pid file
+   * every attempt was launched with and the kills (recorded, not run).
+   */
+  function scriptedAttempts() {
+    type Out = { stdout: string; stderr: string; exit_code: number };
+    const pidFiles: string[] = [];
+    const kills: string[][] = [];
+    const pending: Array<{ resolve: (o: Out) => void; reject: (e: unknown) => void }> = [];
+    const client = {
+      vms: {
+        exec: async function* (_vm: string, opts: { command: string[] }) {
+          kills.push(opts.command);
+          yield { kind: "exit", code: 0 };
+        },
+        execWithSecrets: (_vm: string, opts: { command: string[] }) => {
+          pidFiles.push(opts.command[5] as string);
+          return new Promise<Out>((resolve, reject) => pending.push({ resolve, reject }));
+        },
+      },
+    } as unknown as CoveExecClient;
+    return {
+      driver: new CoveSandboxDriver(client, "vm", { secrets: { kind: "all" } }),
+      pidFiles,
+      kills,
+      attempts: () => pending.length,
+      refuse: (n: number) => pending[n]?.reject(new RateLimitError(429, "HTTP 429")),
+      answer: (n: number, out: Out) => pending[n]?.resolve(out),
+    };
+  }
+
+  it("each 429 retry launches with its own pid file", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    t.mock.method(Math, "random", () => 0);
+    const fake = scriptedAttempts();
+    const res = fake.driver.exec("echo ok", { timeoutMs: 60_000 });
+    await settle();
+    fake.refuse(0);
+    await settle();
+    t.mock.timers.tick(250);
+    await settle();
+    fake.refuse(1);
+    await settle();
+    t.mock.timers.tick(500);
+    await settle();
+    assert.equal(fake.attempts(), 3);
+    assert.equal(new Set(fake.pidFiles).size, 3, "every attempt has a pid file of its own");
+    fake.answer(2, { stdout: "ok\n", stderr: "", exit_code: 0 });
+    assert.deepEqual(await res, { stdout: "ok\n", stderr: "", exitCode: 0 });
+  });
+
+  it("a slow 429 that arrives after the deadline killed the attempt reports the timeout, not 125", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    t.mock.method(Math, "random", () => 0);
+    const fake = scriptedAttempts();
+    const res = fake.driver.exec("echo ok", { timeoutMs: 200 });
+    await settle();
+    // The deadline fires while the first request is still waiting: the group
+    // kill leaves its marker beside that attempt's pid file.
+    t.mock.timers.tick(200);
+    await settle();
+    assert.equal(fake.kills.length, 1);
+    assert.equal(fake.kills[0]?.[4], fake.pidFiles[0]);
+    // Then the 429 arrives. The attempt ran nothing and the time is up:
+    // no retry is sent (it would find the marker and exit 125 with no note).
+    fake.refuse(0);
+    await settle();
+    // Old code backs off 250 ms (random pinned to 0) and then retries; advance
+    // the mocked clock past that, so the retry is sent there and the
+    // assertion fails rather than the test hanging.
+    t.mock.timers.tick(250);
+    await settle();
+    assert.equal(fake.attempts(), 1, "no retry after the deadline");
+    const out = await res;
+    assert.equal(out.exitCode, 124);
+    assert.match(out.stderr, /command timed out after 200ms/);
+  });
+
+  it("a 125 after the deadline killed the attempt reports the timeout", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const fake = scriptedAttempts();
+    const res = fake.driver.exec("echo ok", { timeoutMs: 200 });
+    await settle();
+    t.mock.timers.tick(200);
+    await settle();
+    fake.answer(0, { stdout: "", stderr: "", exit_code: 125 });
+    const out = await res;
+    assert.equal(out.exitCode, 124);
+    assert.match(out.stderr, /command timed out after 200ms/);
+  });
+
   it("the retry's own deadline still fires, 200 ms after the retry went out", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
     t.mock.method(Math, "random", () => 0);

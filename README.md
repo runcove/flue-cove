@@ -215,7 +215,8 @@ on it, since a shell can still stat a file too big to transfer. A VM that is not
 `SandboxDiedError`, as does a `paused` event in the middle of an exec. 429
 (rate limit) and file-API 503 (`unavailable`) are retried, waiting for the
 server's `Retry-After` when it sends one (at most 10 s a wait, 30 s in all
-for one call), else with backoff. A
+for one call), else with backoff. On a secrets exec each attempt gets the
+full `timeoutMs`, and the backoff isn't capped by the time left. A
 `200` the SDK cannot trust (no readable `Content-Length`, or a
 `Content-Encoding` such as gzip added by a proxy) also sends `stat`, `exists`
 and reads to exec. A download whose body stops short of its `Content-Length`

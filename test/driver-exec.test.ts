@@ -10,8 +10,11 @@ import { ConflictError, CoveTimeoutError, NotFoundError, RateLimitError } from "
 import {
   type CoveExecClient,
   CoveSandboxDriver,
+  clientSendsExecEnv,
   INNER,
   KILL_GROUP,
+  RESERVED_PREFIX,
+  sdkSendsExecEnv,
   timeoutSecsFor,
 } from "../src/driver.ts";
 import { localShellClient, scriptedClient } from "./helpers.ts";
@@ -73,14 +76,173 @@ describe("exec: collection", () => {
     assert.deepEqual(res, { stdout: "out\nmore", stderr: "err\n", exitCode: 3 });
   });
 
-  it("runs in cwd with env layered on, quoting both", async () => {
+  it("runs in cwd with env layered on, values intact", async () => {
     const { client } = localShellClient();
-    const driver = new CoveSandboxDriver(client, "vm");
+    const driver = new CoveSandboxDriver(client, "vm", { sendsExecEnv: true });
     const res = await driver.exec('printf "%s|%s" "$(pwd)" "$V"', {
       cwd: dir,
       env: { V: "a 'b' $c" },
     });
     assert.equal(res.stdout, `${dir}|a 'b' $c`);
+  });
+
+  it("sends env under reserved names in the request, with only the names in argv", async () => {
+    const { client, calls } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm", { sendsExecEnv: true });
+    const secret = "value-that-must-stay-out-of-argv";
+    const res = await driver.exec(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a JS template
+      'printf "%s|%s" "$API_TOKEN" "${__FLUE_COVE_E_API_TOKEN-unset}"',
+      {
+        env: { API_TOKEN: secret, N: "1" },
+      },
+    );
+    // The command sees the real name; the reserved one is gone before it runs.
+    assert.equal(res.stdout, `${secret}|unset`);
+    assert.deepEqual(calls[0]?.env, {
+      __FLUE_COVE_E_API_TOKEN: secret,
+      __FLUE_COVE_E_N: "1",
+    });
+    const argv = JSON.stringify(calls[0]?.command);
+    assert.doesNotMatch(argv, /must-stay-out-of-argv/);
+    assert.match(argv, /API_TOKEN N/);
+  });
+
+  it("the launcher wrapper passes env to the user's command and its children", async () => {
+    const { client } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm", { sendsExecEnv: true });
+    const res = await driver.exec('sh -c \'printf "%s" "$CHILD_V"\'', {
+      env: { CHILD_V: "inherited" },
+    });
+    assert.equal(res.stdout, "inherited");
+  });
+
+  it("a user PATH takes effect only for the command: the wrapper still records the start time", async () => {
+    const pidFile = join(dir, "path.pid");
+    const child = spawn("sh", ["-c", INNER, "sh", pidFile, 'printf "%s" "$PATH"', "p", "PATH"], {
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", __FLUE_COVE_E_PATH: "/nonexistent" },
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    let out = "";
+    child.stdout.setEncoding("utf8").on("data", (d: string) => {
+      out += d;
+    });
+    await new Promise((r) => child.on("close", r));
+    assert.equal(out, "/nonexistent");
+    // `p <pid> <starttime>`: the start time exists only if sed and cut ran
+    // with the real PATH (the trap's rm then could not run, so the file stays).
+    assert.match(readFileSync(pidFile, "utf8").trim(), /^p \d+ \d+$/);
+    rmSync(pidFile, { force: true });
+  });
+
+  it("refuses a name in the adapter's reserved namespace, sending nothing", async () => {
+    const { client, calls } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm", { sendsExecEnv: true });
+    await assert.rejects(driver.exec("true", { env: { __FLUE_COVE_X: "1" } }), TypeError);
+    assert.equal(calls.length, 0);
+  });
+
+  it("refuses a NUL in a value locally, naming no value", async () => {
+    const { client, calls } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm", { sendsExecEnv: true });
+    await assert.rejects(driver.exec("true", { env: { X: "a\0b" } }), (err: unknown) => {
+      assert.ok(err instanceof TypeError);
+      assert.match(err.message, /NUL/);
+      return true;
+    });
+    assert.equal(calls.length, 0);
+  });
+
+  it("refuses an invalid env name on the streaming driver, sending nothing", async () => {
+    const { client, calls, secretsCalls } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm", { sendsExecEnv: true });
+    await assert.rejects(driver.exec("true", { env: { "BAD NAME": "x" } }), TypeError);
+    assert.equal(calls.length, 0);
+    assert.equal(secretsCalls.length, 0);
+  });
+
+  it("refuses non-empty env when the SDK cannot send it, naming no value", async () => {
+    const { client, calls } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm", { sendsExecEnv: false });
+    await assert.rejects(
+      driver.exec("true", { env: { X: "must-stay-out-of-errors" } }),
+      (err: unknown) => {
+        assert.ok(err instanceof TypeError);
+        assert.match(err.message, /@runcove\/sdk/);
+        assert.match(err.message, /0\.5\.2/);
+        assert.doesNotMatch(err.message, /must-stay-out-of-errors/);
+        return true;
+      },
+    );
+    assert.equal(calls.length, 0);
+    // An empty env, or none, is not refused.
+    assert.equal((await driver.exec("true", { env: {} })).exitCode, 0);
+    assert.equal((await driver.exec("true")).exitCode, 0);
+  });
+
+  it("the launcher leaves the user's command no positional arguments, with and without env", async () => {
+    const { client } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm", { sendsExecEnv: true });
+    assert.equal((await driver.exec('printf %s "$#"')).stdout, "0");
+    assert.equal((await driver.exec('printf %s "$#"', { env: { A: "1", B: "2" } })).stdout, "0");
+  });
+
+  it("refuses the lowercase reserved namespace in any case, sending nothing", async () => {
+    const { client, calls } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm", { sendsExecEnv: true });
+    for (const name of ["__flue_cove_cmd", "__Flue_Cove_n", "__FLUE_COVE_E_X"]) {
+      await assert.rejects(driver.exec("true", { env: { [name]: "x" } }), TypeError);
+    }
+    assert.equal(calls.length, 0);
+  });
+
+  it("caps a name so the prefixed name fits the server's 256 bytes, naming no value", async () => {
+    const { client, calls } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm", { sendsExecEnv: true });
+    const longest = "N".repeat(256 - RESERVED_PREFIX.length);
+    assert.equal((await driver.exec("true", { env: { [longest]: "v" } })).exitCode, 0);
+    assert.equal(RESERVED_PREFIX.length + longest.length, 256);
+    await assert.rejects(
+      driver.exec("true", { env: { [`${longest}X`]: "must-stay-out-of-errors" } }),
+      (err: unknown) => {
+        assert.ok(err instanceof TypeError);
+        assert.doesNotMatch(err.message, /must-stay-out-of-errors/);
+        return true;
+      },
+    );
+    assert.equal(calls.length, 1);
+  });
+
+  it("trusts the SDK probe only for a client of that SDK's CoveClient", async () => {
+    class Own {}
+    const newSdk = { CoveClient: Own, EXEC_STDIN_MIN_API_VERSION: 8 };
+    assert.equal(clientSendsExecEnv(new Own(), newSdk), true);
+    // A client from another copy of the SDK, or a double, is not vouched for.
+    assert.equal(clientSendsExecEnv({}, newSdk), false);
+    assert.equal(clientSendsExecEnv(new (class Other {})(), newSdk), false);
+    // An SDK without the export vouches for nobody.
+    assert.equal(clientSendsExecEnv(new Own(), { CoveClient: Own }), false);
+    assert.equal(clientSendsExecEnv(new Own(), {}), false);
+  });
+
+  it("a client the SDK cannot vouch for needs sendsExecEnv, and the refusal says so", async () => {
+    const { client, calls } = localShellClient();
+    const plain = new CoveSandboxDriver(client, "vm");
+    await assert.rejects(plain.exec("true", { env: { X: "1" } }), /sendsExecEnv: true/);
+    assert.equal(calls.length, 0);
+    const told = new CoveSandboxDriver(client, "vm", { sendsExecEnv: true });
+    assert.equal((await told.exec("true", { env: { X: "1" } })).exitCode, 0);
+  });
+
+  it("detects the capability from the SDK module: an export only the new SDK has", () => {
+    assert.equal(sdkSendsExecEnv({ CoveClient: class {} }), false);
+    assert.equal(sdkSendsExecEnv({ EXEC_STDIN_MIN_API_VERSION: 8 }), true);
+  });
+
+  it("leaves env out of the request when none is given", async () => {
+    const { client, calls } = scriptedClient(() => [{ kind: "exit", code: 0, timedOut: false }]);
+    await new CoveSandboxDriver(client, "vm").exec("true");
+    assert.equal(calls[0]?.env, undefined);
   });
 
   it("forwards timeoutMs as whole seconds and the signal as the request's signal", async () => {
@@ -257,12 +419,44 @@ describe("exec: secrets", () => {
   it("routes through execWithSecrets with the selector", async () => {
     const { client, secretsCalls, calls } = localShellClient();
     const driver = new CoveSandboxDriver(client, "vm", { secrets: { kind: "all" } });
-    const res = await driver.exec("echo hi; exit 4", { env: { X: "1" } });
+    const res = await driver.exec("echo hi; exit 4");
     assert.deepEqual(res, { stdout: "hi\n", stderr: "", exitCode: 4 });
     assert.equal(secretsCalls.length, 1);
     assert.deepEqual(secretsCalls[0]?.selector, { kind: "all" });
     // Only the helper's own stream ran; no streaming exec for the user command.
     assert.equal(calls.length, 1);
+  });
+
+  it("refuses env with secrets, running nothing and putting no value in argv", async () => {
+    const { client, secretsCalls, calls } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm", { secrets: { kind: "all" } });
+    await assert.rejects(
+      driver.exec("true", { env: { X: "must-stay-out-of-argv" } }),
+      (err: unknown) => {
+        assert.ok(err instanceof TypeError);
+        assert.match(err.message, /`secrets`/);
+        assert.doesNotMatch(err.message, /must-stay-out-of-argv/);
+        return true;
+      },
+    );
+    assert.equal(secretsCalls.length, 0);
+    assert.equal(calls.length, 0);
+  });
+
+  it("refuses an invalid env name on the secrets driver, sending nothing", async () => {
+    const { client, secretsCalls, calls } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm", { secrets: { kind: "all" } });
+    await assert.rejects(driver.exec("true", { env: { "BAD NAME": "x" } }), TypeError);
+    assert.equal(secretsCalls.length, 0);
+    assert.equal(calls.length, 0);
+  });
+
+  it("accepts an empty env with secrets", async () => {
+    const { client, secretsCalls } = localShellClient();
+    const driver = new CoveSandboxDriver(client, "vm", { secrets: { kind: "all" } });
+    const res = await driver.exec("echo hi", { env: {} });
+    assert.equal(res.exitCode, 0);
+    assert.equal(secretsCalls.length, 1);
   });
 
   it("enforces timeoutMs itself (the route has none): 124 and the group is killed", {
@@ -391,7 +585,7 @@ describe("the group-kill helper", { skip: !LINUX && "needs /proc and setsid" }, 
     const pidFile = join(dir, "late.pid");
     const marker = join(dir, "late.ran");
     assert.equal(await run(KILL_GROUP, pidFile), 0);
-    assert.equal(await run(INNER, pidFile, `touch '${marker}'`, "p"), 125);
+    assert.equal(await run(INNER, pidFile, `touch '${marker}'`, "p", ""), 125);
     assert.equal(existsSync(marker), false, "the user command ran after the kill");
     assert.equal(existsSync(pidFile), false);
     assert.equal(existsSync(`${pidFile}.kill`), false);
@@ -399,7 +593,9 @@ describe("the group-kill helper", { skip: !LINUX && "needs /proc and setsid" }, 
 
   it("a command that started first is killed, and the kill cleans up after itself", async () => {
     const pidFile = join(dir, "early.pid");
-    const victim = spawn("sh", ["-c", INNER, "sh", pidFile, "sleep 30", "p"], { stdio: "ignore" });
+    const victim = spawn("sh", ["-c", INNER, "sh", pidFile, "sleep 30", "p", ""], {
+      stdio: "ignore",
+    });
     const closed = new Promise((r) => victim.on("close", r));
     try {
       await eventually(

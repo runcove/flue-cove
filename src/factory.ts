@@ -47,7 +47,8 @@ function isStatus(err: unknown, status: number, code?: string): boolean {
 export const DEFAULT_ID_TAG = "flue-id";
 
 /** Options shared by both factories. */
-export interface CoveSandboxOptions extends Pick<CoveDriverOptions, "onOutput" | "secrets"> {
+export interface CoveSandboxOptions
+  extends Pick<CoveDriverOptions, "onOutput" | "secrets" | "sendsExecEnv"> {
   /** The sandbox's working directory, created with `mkdir -p` if missing. Default `/workspace`. */
   cwd?: string;
   /**
@@ -74,6 +75,7 @@ function driverOptions(files: CoveFiles | undefined, opts: CoveSandboxOptions): 
   if (files) out.files = files;
   if (opts.onOutput) out.onOutput = opts.onOutput;
   if (opts.secrets) out.secrets = opts.secrets;
+  if (opts.sendsExecEnv !== undefined) out.sendsExecEnv = opts.sendsExecEnv;
   return out;
 }
 

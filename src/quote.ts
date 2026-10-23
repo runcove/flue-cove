@@ -1,6 +1,6 @@
 /**
  * POSIX shell quoting for everything the adapter splices into a guest shell
- * script: paths, environment values, the working directory.
+ * script: paths and the working directory.
  */
 
 /**
@@ -30,24 +30,24 @@ export function validateEnvName(name: string): void {
 
 export interface ScriptOptions {
   cwd?: string;
-  env?: Record<string, string>;
 }
 
 /**
- * The shell script that runs `command` with `env` exported and `cwd` as the
- * working directory. A failing `cd` skips the command and leaves `cd`'s
- * non-zero status as the script's exit code.
+ * The shell script that runs `command` with `cwd` as the working directory. A
+ * failing `cd` skips the command and leaves `cd`'s non-zero status as the
+ * script's exit code.
+ *
+ * It no longer takes `env`: values written into a script reach the guest as
+ * part of an argv, where `ps` and `/proc/<pid>/cmdline` show them. The driver sends
+ * them in the exec request's `env` field, the command's process environment.
  */
-export function buildScript(command: string, { cwd, env }: ScriptOptions): string {
-  const lines: string[] = [];
-  for (const [name, value] of Object.entries(env ?? {})) {
-    validateEnvName(name);
-    lines.push(`export ${name}=${shellQuote(String(value))}`);
+export function buildScript(command: string, opts: ScriptOptions = {}): string {
+  if ("env" in opts) {
+    throw new TypeError(
+      "buildScript no longer takes env: pass it in the exec request's env field (CoveSandboxDriver.exec does)",
+    );
   }
-  if (cwd !== undefined) {
-    lines.push(`cd -- ${shellQuote(cwd)} && {\n${command}\n}`);
-  } else {
-    lines.push(command);
-  }
-  return lines.join("\n");
+  const { cwd } = opts;
+  if (cwd === undefined) return command;
+  return `cd -- ${shellQuote(cwd)} && {\n${command}\n}`;
 }

@@ -54,18 +54,25 @@ describe("buildScript", () => {
     assert.equal(buildScript("echo hi", {}), "echo hi");
   });
 
-  it("exports env with quoted values and cds with -- into the cwd", () => {
+  it("cds with -- into the cwd, however odd its name", () => {
     const dir = sh("mktemp -d").trim();
     const weird = `${dir}/-dir with 'quote'\nand newline`;
     execFileSync("mkdir", ["--", weird]);
-    const out = sh(
-      buildScript('printf "%s|%s|%s" "$PWD" "$GREETING" "$EMPTY"', {
-        cwd: weird,
-        env: { GREETING: "it's $HOME `x`", EMPTY: "" },
-      }),
-    );
-    assert.equal(out, `${weird}|it's $HOME \`x\`|`);
+    const out = sh(buildScript('printf "%s" "$PWD"', { cwd: weird }));
+    assert.equal(out, weird);
     execFileSync("rm", ["-r", "--", dir]);
+  });
+
+  it("writes no export line: env travels in the request, not the script", () => {
+    assert.doesNotMatch(buildScript("true", { cwd: "/tmp" }), /export/);
+  });
+
+  it("throws a TypeError when passed env, rather than drop it", () => {
+    assert.throws(
+      () =>
+        buildScript("true", { env: { X: "1" } } as unknown as Parameters<typeof buildScript>[1]),
+      TypeError,
+    );
   });
 
   it("does not run the command when cd fails", () => {
@@ -80,9 +87,5 @@ describe("buildScript", () => {
 
   it("keeps a multi-line command intact", () => {
     assert.equal(sh(buildScript("a=1\nb=2\necho $((a+b))", {})), "3\n");
-  });
-
-  it("validates env names before building anything", () => {
-    assert.throws(() => buildScript("true", { env: { "BAD NAME": "x" } }), TypeError);
   });
 });

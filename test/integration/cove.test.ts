@@ -12,6 +12,7 @@ import { after, before, describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { type Sandbox, SandboxDiedError } from "@flue/runtime";
 import type { CoveClient } from "@runcove/sdk";
+import { sdkSendsExecEnv } from "../../src/driver.ts";
 import { CoveSandboxDriver, cove, coveVms, filesFor, fromEnv } from "../../src/index.ts";
 
 const enabled =
@@ -68,10 +69,19 @@ describe("Cove integration", {
     assert.deepEqual(tagged, [vm], "exactly one VM carries the id");
   });
 
-  it("exec: stdout, stderr, a non-zero exit, cwd and env", async () => {
+  it("exec: stdout, stderr, a non-zero exit and cwd", async () => {
     const res = await sandbox.exec("echo out; echo err >&2; exit 7");
     assert.deepEqual(res, { stdout: "out\n", stderr: "err\n", exitCode: 7 });
-    await sandbox.mkdir("sub dir");
+    await sandbox.mkdir("sub dir", { recursive: true });
+    const r1 = await sandbox.exec("pwd", { cwd: "sub dir" });
+    assert.equal(r1.stdout, "/workspace/sub dir\n");
+  });
+
+  it("exec: env reaches the command", {
+    skip:
+      !sdkSendsExecEnv() && "the installed @runcove/sdk (0.5.2 or older) does not send exec env",
+  }, async () => {
+    await sandbox.mkdir("sub dir", { recursive: true });
     const r2 = await sandbox.exec('printf "%s|%s" "$(pwd)" "$GREETING"', {
       cwd: "sub dir",
       env: { GREETING: "it's $HOME" },

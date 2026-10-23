@@ -60,6 +60,19 @@ every file operation over exec. A newer server also names a `HEAD` error's code
 (`X-Cove-Error-Code`) and sends `Last-Modified`, so `stat` tells a missing
 VM from a missing file and returns `mtime`.
 
+**Exec `env`.** `exec`'s `env` needs `cove-server` 0.34.3 or newer (an older
+server ignores the field without a word, so the command would run without its
+variables), a guest agent at protocol 9 or newer (a VM from an older snapshot
+refuses the exec with an error rather than run without them), and an
+`@runcove/sdk` release newer than 0.5.2, the first to send the field. With an
+older SDK the driver throws a `TypeError` for a non-empty `env` before sending
+anything. The driver trusts the SDK it imported only for a client that is an
+instance of that SDK's `CoveClient`; for a client from another copy of the SDK
+(or any other object), pass `sendsExecEnv: true` in the factory options once
+that client's SDK is newer than 0.5.2, or `env` is refused. Names starting
+with `__flue_cove_` (any case) are reserved, and a name is at most 242
+characters.
+
 ## Configuration
 
 `fromEnv()`, and `coveVms()` when you pass no `client`, read:
@@ -195,7 +208,7 @@ Flue never creates or destroys provider resources; the application does.
 
 | Flue | Cove |
 |---|---|
-| `exec` | streaming `vms.exec`; the command runs under `bash` when the guest has it, else `sh`; `cwd`/`env` become a quoted `cd`/`export` prefix (env names are validated); `timeoutMs` → `timeout_secs = ceil(ms / 1000)` |
+| `exec` | streaming `vms.exec`; the command runs under `bash` when the guest has it, else `sh`; `cwd` becomes a quoted `cd` prefix; `env` is sent as the request's `env` field, so the values are the command's process environment and never appear in its argv, `ps` or `/proc/*/cmdline` (env names are validated; see "Exec `env`" above for the server, guest agent and SDK it needs); `timeoutMs` → `timeout_secs = ceil(ms / 1000)` |
 | `readFile`, `readFileBuffer` | file API `GET`; exec fallback (`base64`) |
 | `writeFile` | file API `PUT` (atomic in the guest); exec fallback (chunked `base64`, then `cat >` so symlinks are written through) |
 | `stat`, `exists` | file API `HEAD`; exec fallback (`stat -L`, `test -L`, `test -e`) |
@@ -237,6 +250,12 @@ recorded. Anything else (no answer, a 429 or 5xx after the retries, a 401 or
 again. Once the route is known to be missing, every file operation runs over
 exec. `CoveSandboxDriver.fileRoute`
 reports what the driver found.
+
+`exec`'s `env` is not available together with the `secrets` option: Cove's
+secrets route has no environment field, and the adapter will not write values
+into the command line, so it throws a `TypeError` before running anything. Put
+tokens in `secrets` (Cove injects them into the guest) and keep `env` for
+non-secret settings on drivers without `secrets`.
 
 Every option Flue defines (`exec`'s `cwd`, `env`, `timeoutMs`, `signal`;
 `mkdir`'s `recursive`; `rm`'s `recursive` and `force`) is honoured exactly. An

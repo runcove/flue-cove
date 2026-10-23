@@ -20,10 +20,15 @@ import {
 } from "@runcove/sdk";
 import type { CoveExecClient } from "../src/driver.ts";
 
+// The published SDK's ExecOptions has no `env` until the release after 0.5.2.
+type FakeExecOptions = ExecOptions & { env?: Record<string, string> };
+
 export interface ExecCall {
   vm: string;
   command: string[];
   timeoutSecs: number | undefined;
+  /** The request's `env` field, as sent (not part of argv). */
+  env: Record<string, string> | undefined;
   signal: AbortSignal | undefined;
 }
 
@@ -76,15 +81,19 @@ export function localShellClient() {
 
   async function* exec(
     vm: string,
-    opts: ExecOptions,
+    opts: FakeExecOptions,
     overrides?: { signal?: AbortSignal },
   ): AsyncGenerator<ExecEvent> {
     const signal = overrides?.signal;
-    calls.push({ vm, command: opts.command, timeoutSecs: opts.timeoutSecs, signal });
+    calls.push({ vm, command: opts.command, timeoutSecs: opts.timeoutSecs, env: opts.env, signal });
     signal?.throwIfAborted();
     const [file, ...args] = opts.command;
     if (!file) throw new Error("empty argv");
-    const child = spawn(file, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(file, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      // Like the guest agent: the request's env is layered over the defaults.
+      env: { ...process.env, ...opts.env },
+    });
     const events = channel<ExecEvent>();
     let timedOut = false;
     const timer =
@@ -160,13 +169,14 @@ export function scriptedClient(
   const calls: ExecCall[] = [];
   async function* exec(
     vm: string,
-    opts: ExecOptions,
+    opts: FakeExecOptions,
     overrides?: { signal?: AbortSignal },
   ): AsyncGenerator<ExecEvent> {
     const call = {
       vm,
       command: opts.command,
       timeoutSecs: opts.timeoutSecs,
+      env: opts.env,
       signal: overrides?.signal,
     };
     calls.push(call);

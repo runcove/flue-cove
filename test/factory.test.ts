@@ -552,6 +552,18 @@ describe("cove(): the pure adapter", () => {
     assert.ok(fake.execs.every((e) => e.vm === "existing"));
   });
 
+  it("passes sendsExecEnv through to the driver: env is refused without it, sent with it", async () => {
+    const fake = fakeCove();
+    fake.vms.set("v", { name: "v", state: "running", tags: {} });
+    const without = await cove(fake.client, "v", { files: noFiles }).createSandbox({ id: "x" });
+    await assert.rejects(without.exec("true", { env: { A: "1" } }), TypeError);
+    const withIt = await cove(fake.client, "v", {
+      files: noFiles,
+      sendsExecEnv: true,
+    }).createSandbox({ id: "x" });
+    await withIt.exec("true", { env: { A: "1" } });
+  });
+
   it("defaults the cwd to /workspace", async () => {
     const fake = fakeCove();
     const sandbox = await cove(fake.client, "v", { files: noFiles }).createSandbox({ id: "x" });

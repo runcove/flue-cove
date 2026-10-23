@@ -22,9 +22,10 @@ import {
   type ShellResult,
 } from "@flue/runtime";
 import type { CoveClient, ExecEvent, InjectSelector } from "@runcove/sdk";
+import * as coveSdk from "@runcove/sdk";
 import { apiErrorStatus, isDeadline, isPlainCoveError } from "./errors.ts";
 import { type CoveFiles, fileErrorStatus } from "./files.ts";
-import { buildScript } from "./quote.ts";
+import { buildScript, validateEnvName } from "./quote.ts";
 import {
   abortableSleep,
   isRateLimited,
@@ -69,10 +70,23 @@ export interface CoveDriverOptions {
    * enforces `timeoutMs` itself by killing the command's process group.
    */
   secrets?: InjectSelector;
+  /**
+   * Whether the client sends the exec request's `env` field. Trusted from the
+   * installed `@runcove/sdk` only for a client that is an instance of its
+   * `CoveClient`; for any other client (another copy of the SDK, a test
+   * double) set it to `true` once you know that client's SDK is newer than
+   * 0.5.2. Without it, `exec` refuses a non-empty `env`.
+   */
+  sendsExecEnv?: boolean;
 }
 
 interface ExecOptions {
   cwd?: string;
+  /**
+   * Sent as the exec request's `env`: the command's process environment, never
+   * its argv. Refused with a `TypeError` when the driver has `secrets`, whose
+   * route has no such field; put tokens in `secrets` instead.
+   */
   env?: Record<string, string>;
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -101,6 +115,13 @@ export function uploadTimeoutMs(bytes: number): number {
 const WRITE_CHUNK_BYTES = 64 * 1024;
 
 /**
+ * Prefix of the variables that carry the user's `env` values in the exec
+ * request. The values never appear in argv; INNER re-exports each under its
+ * real name just before the command runs.
+ */
+export const RESERVED_PREFIX = "__FLUE_COVE_E_";
+
+/**
  * Runs the user's script under bash when the guest has it (else sh), as the
  * leader of a new process group (`setsid -w`) when the guest has setsid,
  * recording `<mode> <pid> <starttime>` in a pid file so the command can be
@@ -109,19 +130,26 @@ const WRITE_CHUNK_BYTES = 64 * 1024;
  * process group the command was started in, which setsid leaves) and an
  * aborted request kills nothing; the group kill is what makes `timeoutMs` and
  * abort actually stop the command.
- * `$1` = inner script, `$2` = pid file, `$3` = user script.
+ * `$1` = inner script, `$2` = pid file, `$3` = user script, `$4` = the names
+ * of the user's environment variables (INNER re-exports them).
  */
 const LAUNCH =
   "if command -v bash >/dev/null 2>&1; then s=bash; else s=sh; fi; " +
-  'if setsid -w true 2>/dev/null; then exec setsid -w "$s" -c "$1" "$s" "$2" "$3" g; ' +
-  'else exec "$s" -c "$1" "$s" "$2" "$3" p; fi';
+  'if setsid -w true 2>/dev/null; then exec setsid -w "$s" -c "$1" "$s" "$2" "$3" g "$4"; ' +
+  'else exec "$s" -c "$1" "$s" "$2" "$3" p "$4"; fi';
 export const INNER =
-  "__flue_cove_pidfile=$1; __flue_cove_cmd=$2; __flue_cove_mode=$3; shift 3; " +
+  "__flue_cove_pidfile=$1; __flue_cove_cmd=$2; __flue_cove_mode=$3; __flue_cove_names=$4; shift 4; " +
   "{ __flue_cove_st=$(sed 's/^.*) //' /proc/$$/stat | cut -d' ' -f20); " +
   'echo "$__flue_cove_mode $$ $__flue_cove_st" > "$__flue_cove_pidfile"; } 2>/dev/null; ' +
   'if [ -e "$__flue_cove_pidfile.kill" ]; then ' +
   'rm -f -- "$__flue_cove_pidfile" "$__flue_cove_pidfile.kill"; exit 125; fi; ' +
   "trap 'rm -f -- \"$__flue_cove_pidfile\"' EXIT; " +
+  // The user's variables arrive under reserved names so they cannot touch the
+  // launcher or this script (PATH, BASH_ENV, IFS ...); only now, just before
+  // the command, do they take their real names.
+  `for __flue_cove_n in $__flue_cove_names; do ` +
+  `eval "export $__flue_cove_n=\\"\\$${RESERVED_PREFIX}$__flue_cove_n\\"; unset ${RESERVED_PREFIX}$__flue_cove_n"; done; ` +
+  "unset __flue_cove_n __flue_cove_names; " +
   'eval "$__flue_cove_cmd"';
 /**
  * Kill what pid file `$1` records, then drop the file.
@@ -256,9 +284,66 @@ function newPidFile(): string {
   return `/tmp/.flue-cove-${randomUUID()}.pid`;
 }
 
+/**
+ * The longest env name accepted: the server allows 256 bytes per name, and the
+ * adapter sends each under a prefix of RESERVED_PREFIX.length bytes. Names are
+ * ASCII (validateEnvName), so characters are bytes.
+ */
+const ENV_NAME_MAX = 256 - RESERVED_PREFIX.length;
+
+/**
+ * Validate every name in `env` and return it with each value as a string.
+ * Names starting with the reserved prefix (any case: INNER's own variables are
+ * lowercase) are refused, as is a name too long once prefixed, and a NUL in a
+ * value (the server would answer 400).
+ */
+function checkedEnv(env: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(env)) {
+    validateEnvName(name);
+    if (/^__flue_cove_/i.test(name)) {
+      throw new TypeError(
+        `invalid environment variable name ${JSON.stringify(name)}: names starting with __flue_cove_ (in any case) are reserved for the adapter`,
+      );
+    }
+    if (name.length > ENV_NAME_MAX) {
+      throw new TypeError(
+        `invalid environment variable name of ${name.length} characters: the longest allowed is ${ENV_NAME_MAX}`,
+      );
+    }
+    const text = String(value);
+    if (text.includes("\0")) {
+      throw new TypeError(`environment variable ${name}: a value cannot contain a NUL byte`);
+    }
+    out[name] = text;
+  }
+  return out;
+}
+
+/**
+ * Whether the installed `@runcove/sdk` sends the exec request's `env` field.
+ * Every published SDK up to 0.5.2 builds the exec body without it. The first
+ * release that sends `env` also exports `EXEC_STDIN_MIN_API_VERSION`, which
+ * those do not, so its presence is the test.
+ */
+export function sdkSendsExecEnv(sdk: object = coveSdk): boolean {
+  return typeof (sdk as Record<string, unknown>).EXEC_STDIN_MIN_API_VERSION === "number";
+}
+
+/**
+ * Whether `client` sends the exec request's `env` field. The SDK probe speaks
+ * for the client only when the client is an instance of that SDK's own
+ * `CoveClient`: a client from another copy (or a double) may be older than
+ * the copy flue imported, so it must say so with `sendsExecEnv`.
+ */
+export function clientSendsExecEnv(client: object, sdk: object = coveSdk): boolean {
+  const ctor = (sdk as { CoveClient?: unknown }).CoveClient;
+  return typeof ctor === "function" && client instanceof ctor && sdkSendsExecEnv(sdk);
+}
+
 /** The argv that launches `script` under {@link LAUNCH}, recording its pid in `pidFile`. */
-function launchArgv(script: string, pidFile: string): string[] {
-  return ["sh", "-c", LAUNCH, "sh", INNER, pidFile, script];
+function launchArgv(script: string, pidFile: string, envNames: string[] = []): string[] {
+  return ["sh", "-c", LAUNCH, "sh", INNER, pidFile, script, envNames.join(" ")];
 }
 
 interface RunResult {
@@ -273,6 +358,7 @@ export class CoveSandboxDriver implements SandboxDriver {
   readonly #files: CoveFiles | undefined;
   readonly #onOutput: CoveDriverOptions["onOutput"];
   readonly #secrets: InjectSelector | undefined;
+  readonly #sendsEnv: boolean;
   /** The key lacks files:read (or files:write): skip the API from then on. */
   #readScopeDenied = false;
   #writeScopeDenied = false;
@@ -291,6 +377,7 @@ export class CoveSandboxDriver implements SandboxDriver {
     this.#files = options.files;
     this.#onOutput = options.onOutput;
     this.#secrets = options.secrets;
+    this.#sendsEnv = options.sendsExecEnv ?? clientSendsExecEnv(client);
   }
 
   /** The VM this driver targets. */
@@ -311,26 +398,61 @@ export class CoveSandboxDriver implements SandboxDriver {
 
   async exec(command: string, options: ExecOptions = {}): Promise<ShellResult> {
     refuseUnknownOptions("exec", options, ["cwd", "env", "timeoutMs", "signal"]);
+    const env = options.env === undefined ? undefined : checkedEnv(options.env);
     const script = buildScript(command, {
       ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
-      ...(options.env !== undefined ? { env: options.env } : {}),
     });
-    if (this.#secrets) return this.#execWithSecrets(script, options);
+    if (this.#secrets) {
+      // Cove's secrets route has no `env` field, and the only other way to
+      // reach the command is to write the values into its argv, where the
+      // guest's process list shows them. Refuse rather than leak.
+      if (env !== undefined && Object.keys(env).length > 0) {
+        throw new TypeError(
+          "exec: `env` cannot be combined with the `secrets` option, because the secrets route has no environment field and values written into the command would show in the guest's process list; pass tokens through `secrets` instead",
+        );
+      }
+      return this.#execWithSecrets(script, options);
+    }
+    const sent = env !== undefined && Object.keys(env).length > 0 ? env : undefined;
+    if (sent !== undefined && !this.#sendsEnv) {
+      throw new TypeError(
+        "exec: `env` needs an @runcove/sdk that sends the exec request's env field, and the installed one cannot, so the command would run without its variables; install an @runcove/sdk release newer than 0.5.2 (the first to send exec env); if this client's SDK is already newer (a client from another copy of the SDK), pass `sendsExecEnv: true`",
+      );
+    }
     const pidFile = newPidFile();
-    return this.#execStreaming(launchArgv(script, pidFile), pidFile, options);
+    return this.#execStreaming(
+      launchArgv(script, pidFile, sent === undefined ? [] : Object.keys(sent)),
+      pidFile,
+      options,
+      sent,
+    );
   }
 
   async #execStreaming(
     argv: string[],
     pidFile: string,
     options: ExecOptions,
+    env: Record<string, string> | undefined,
   ): Promise<ShellResult> {
     const timeoutSecs = timeoutSecsFor(options.timeoutMs);
     let stdout = "";
     let stderr = "";
     try {
       const stream = this.#stream(
-        { command: argv, ...(timeoutSecs !== undefined ? { timeoutSecs } : {}) },
+        {
+          command: argv,
+          ...(timeoutSecs !== undefined ? { timeoutSecs } : {}),
+          // The request's `env` is the process environment, not argv. Values
+          // go under reserved names (INNER renames them), so the user's PATH,
+          // BASH_ENV and the like cannot affect the launcher.
+          ...(env !== undefined
+            ? {
+                env: Object.fromEntries(
+                  Object.entries(env).map(([k, v]) => [RESERVED_PREFIX + k, v]),
+                ),
+              }
+            : {}),
+        },
         options.signal,
       );
       for await (const ev of stream) {
@@ -458,7 +580,7 @@ export class CoveSandboxDriver implements SandboxDriver {
    * refuses before the command starts, so no event has been seen when it does.
    */
   async *#stream(
-    opts: { command: string[]; timeoutSecs?: number },
+    opts: { command: string[]; timeoutSecs?: number; env?: Record<string, string> },
     signal: AbortSignal | undefined,
   ): AsyncGenerator<ExecEvent> {
     let waited = 0;

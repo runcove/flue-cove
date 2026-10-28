@@ -15,7 +15,8 @@
 #   - sha256.sum.minisig verifies sha256.sum against that key;
 #   - its trusted comment is exactly the source tag the release was signed for, of a family
 #     that package takes: cove-server-vX.Y.Z or sdk-ts-vX.Y.Z for an npm SDK, cove-server-vX.Y.Z
-#     or sdk-py-vX.Y.Z for PyPI, flue-vX.Y.Z (only) for @runcove/flue;
+#     or sdk-py-vX.Y.Z for PyPI, flue-vX.Y.Z (only) for @runcove/flue. A cove-vX.Y.Z product
+#     release (0.47.0 on) carries no package, so it is named and refused;
 #   - sha256.sum has exactly one line per asset, and the asset's sha256 matches it;
 #   - every archive member is a plain file or directory at a safe relative path, and every npm
 #     tarball member sits under package/ with a POSIX ustar header, so npm and this script
@@ -106,8 +107,8 @@ minisign -V -q -P "$pubkey" -m "$dir/sha256.sum" -x "$dir/sha256.sum.minisig" >/
     || refuse "sha256.sum.minisig does not verify sha256.sum against the pinned minisign public key"
 # minisign has verified the trusted comment (line 3 of the signature file) along with the file.
 comment="$(sed -n 3p -- "$dir/sha256.sum.minisig")"
-[[ "$comment" =~ ^trusted\ comment:\ ((cove-server|sdk-ts|sdk-py|flue)-v[0-9]+\.[0-9]+\.[0-9]+)$ ]] \
-    || refuse "the signature's trusted comment is not 'trusted comment: <source tag>' with a cove-server, sdk-ts, sdk-py or flue release tag"
+[[ "$comment" =~ ^trusted\ comment:\ ((cove-server|cove|sdk-ts|sdk-py|flue)-v[0-9]+\.[0-9]+\.[0-9]+)$ ]] \
+    || refuse "the signature's trusted comment is not 'trusted comment: <source tag>' with a cove-server, cove, sdk-ts, sdk-py or flue release tag"
 source_tag="${BASH_REMATCH[1]}"
 # Each package takes only its own source releases: the SDKs ride cove-server releases or their
 # own sdk-ts / sdk-py tags; Flue has only flue tags.

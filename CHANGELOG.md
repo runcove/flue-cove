@@ -6,6 +6,20 @@ All notable changes to `flue-cove`. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-25
+
+### Changed
+
+- **The adapter accepts `@runcove/sdk` 0.6.x as well as 0.5.x.** Its dependency range is now `>=0.5.0 <0.7.0`, so a project can install it next to the 0.6.0 SDK without a second copy or a peer conflict.
+
+### Fixed
+
+- A secrets-injected exec that hits its `timeoutMs` while Cove's first answer is still a slow 429 now returns the timeout result (exit code 124 with a note) instead of retrying into a launch that exits 125 with no explanation. Each retry also launches with its own pid file, so a deadline kill aimed at one attempt can no longer stop the next.
+
+### Security
+
+- **`exec` passes `env` in the exec request, not inside the shell script.** The values no longer show in the guest's process list (`ps`, `/proc/*/cmdline`) while the command runs: they travel as the request's process environment under reserved `__FLUE_COVE_E_<NAME>` names, only the names are in the command line, and the adapter's launcher renames them just before the command starts, so a `PATH` or `BASH_ENV` in `env` affects the command alone. **Breaking:** `exec` with `env` on a driver that has `secrets` now throws a `TypeError` before running anything, because Cove's secrets route has no environment field: put tokens in `secrets`. **Breaking:** names starting with `__flue_cove_` (any case) are refused, and a value containing NUL is refused locally. **Breaking:** the exported `buildScript` no longer takes `env` (it throws a `TypeError` if given one) and writes no `export` lines. Needs `cove-server` 0.34.3 or newer, a guest agent at protocol 9 or newer, and an `@runcove/sdk` release newer than 0.5.2 that sends `env`; with an older SDK, `exec` throws a `TypeError` for a non-empty `env` rather than run the command without it.
+
 ## [0.3.2] - 2026-10-07
 
 ### Changed
